@@ -253,6 +253,7 @@ class BlackjackOffPolicyAgentRandom():
         return episode
 
     def learn(self):
+        self.b = defaultdict(get_probability) # for epsilon-soft policy
         episode = self.getEpisode()
 
         Q = self.Q

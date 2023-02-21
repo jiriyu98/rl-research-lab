@@ -1,13 +1,19 @@
 from threading import Lock, Thread
 from time import sleep
 
-import gymnasium as gym
+import gym
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.distributions import Categorical
+
+# cuda
+if torch.cuda.is_available():
+    torch.cuda.device(0)
+
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 # global config
 
@@ -77,7 +83,7 @@ class Worker:
             global_parameter._grad = local_parameter.grad
 
     def trainEpisode(self, global_actor: Actor, global_critic: Critic, actor_optimizer, critic_optimizer, loop_count, gamma=1.0):
-        state, _ = self.env.reset()
+        state = self.env.reset()
         rewards = []
         states = [state]
         saved_log_probs = []
@@ -98,7 +104,7 @@ class Worker:
             action, saved_log_prob = actor(state)
             saved_log_probs.append(saved_log_prob)
 
-            state, reward, done, _, _ = self.env.step(action.item())
+            state, reward, done, _ = self.env.step(action.item())
 
             # save rewards and states
             rewards.append(reward)
@@ -124,21 +130,28 @@ class Worker:
         returns = torch.tensor(returns)
         returns = (returns - returns.mean()) / (returns.std() + eps)
 
+        # advantage: R - state-value-func(state)
+        # w = w + 2 * advantage * d theta (advantage)
         for i in range(len(returns)):
             advantage = R - critic(states[i])
             actor_loss.append(-saved_log_probs[i] * advantage.detach())
-            critic_loss.append(-2 * advantage * advantage.detach())
+            critic_loss.append(2 * advantage * advantage.detach())
+            # TODO: check it later
+            # critic_loss.append(advantage * advantage)
 
         # step3: update global vars by local vars
+        # atomic
         local_update.acquire()  # lock
 
         actor_optimizer.zero_grad()
         critic_optimizer.zero_grad()
 
         actor_loss = torch.cat(actor_loss).sum()
+        actor_loss.to(device)
         actor_loss.backward()
 
         critic_loss = torch.cat(critic_loss).sum()
+        critic_loss.to(device)
         critic_loss.backward()
 
         self.update(actor, global_actor)
@@ -191,7 +204,7 @@ class Coordinator:
         # this config probably needs 700 epsidoes to converge
         self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=3e-3)
         # make advantage to be trivial
-        self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=1e-6)
+        self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=1e-2)
 
     def train(self):
         worker_num = 3

@@ -22,13 +22,10 @@ class IntrinsicReward(nn.Module):
     def forward(self, input, hidden_state=None):
         s0, a0, r1, d1 = input
 
-        s0 = torch.from_numpy(s0).float().unsqueeze(0)
-        # a0 = torch.from_numpy(a0).float().unsqueeze(0)
-        # r1 = torch.from_numpy(r1).float().unsqueeze(0)
-        # d1 = torch.from_numpy(d1).float().unsqueeze(0)
-        a0 = torch.tensor([a0]).unsqueeze(0)
-        r1 = torch.tensor([r1]).unsqueeze(0)
-        d1 = torch.tensor([d1]).unsqueeze(0)
+        s0 = torch.from_numpy(s0).float().unsqueeze(0).detach()
+        a0 = torch.tensor([a0]).unsqueeze(0).detach()
+        r1 = torch.tensor([r1]).unsqueeze(0).detach()
+        d1 = torch.tensor([d1]).unsqueeze(0).detach()
 
         # cat all the input
         x = torch.cat((s0, a0, r1, d1), 1)
@@ -37,6 +34,8 @@ class IntrinsicReward(nn.Module):
             h0 = self.initHidden()
         else:
             h0 = hidden_state
+
+        h0 = h0.detach()
 
         x, hn = self.rnn(x, h0)
         x = F.relu(self.affline1(x))

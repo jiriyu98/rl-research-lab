@@ -1,4 +1,5 @@
 from collections import deque
+from itertools import count
 
 import numpy as np
 import torch.optim as optim
@@ -86,18 +87,20 @@ class Agent():
     def trainEpisode(self, trajectory):
         # update agent/policy
         objective = 0
-        stateReturn = 0
+        episode_intrinsic_return = 0
         discounted = 1
+        episode_extrinsic_return = 0
 
         # TODO: Replace "tuple" with a better name
         for tuple in trajectory[::-1]:
             saved_log = tuple["saved_log"]
-            # float, no need of detach()
             intrinsic_reward = tuple["intrinsic_reward"]
+            extrinsic_reward = tuple["extrinsic_reward"]
 
-            stateReturn += discounted * intrinsic_reward.item()
-            objective += saved_log * stateReturn
+            episode_intrinsic_return += discounted * intrinsic_reward.item()
+            episode_extrinsic_return += discounted * extrinsic_reward
 
+            objective += saved_log * episode_intrinsic_return
             discounted = discounted * self.gamma
 
         # XXX: Probably need to clarify if the objective should be updated with a std...? like REINFORCE
@@ -109,7 +112,7 @@ class Agent():
         objective.backward(retain_graph=True)
         self.policy_optimizer.step()
 
-        return
+        return episode_extrinsic_return
 
     def trainLifetimeValueAndIntrinsicReward(self):
         # update intrinsic reward
@@ -124,7 +127,6 @@ class Agent():
 
         for outer_index in range(len(self.lifetime_trajectory)):
             return_life = 0
-            objective_intrinsic_reward = 0
 
             assert (len(sliding_window) > 0)
 
@@ -176,8 +178,12 @@ class Agent():
         return
 
     def trainLife(self):
-        while True:
-            # preparations:
+        # global preparations:
+        # 1) create running_reward for one life
+        running_reward = 0
+
+        for i in count(1):
+            # life preparations:
             # 1) clear the lifetime trajectory
             self.lifetime_trajectory.clear()
 
@@ -186,7 +192,6 @@ class Agent():
             self.policy = Policy(state_space=2, action_space=4)
             seed = np.random.randint(1, 1000)
 
-            print("step2")
             # step2: update policy
             for _ in range(self.episode_num):
                 # 1) generate trajectory
@@ -194,14 +199,19 @@ class Agent():
                 # 2) add to lifetime
                 self.lifetime_trajectory += trajectory
                 # 3) train episode, update policy
-                self.trainEpisode(trajectory)
+                episode_reward = self.trainEpisode(trajectory)
 
-            print("step3 + 4")
+                # 4) log
+                running_reward = 0.05 * episode_reward + \
+                    (1 - 0.05) * running_reward
+
             # step3: update intrinsic reward function
             # step4: update lifetime value function
             self.trainLifetimeValueAndIntrinsicReward()
 
-            print("Train one round")
+            # if i % 10 == 0:
+            print("Train {} round \t running reward {:.2f} \t the latest episode reward {:.2f} \t the latest episode length {:d}".format(
+                i, running_reward, episode_reward, len(trajectory)))
 
 
 def main():

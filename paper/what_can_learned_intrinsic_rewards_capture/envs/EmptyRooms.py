@@ -89,7 +89,7 @@ class EmptyRooms(gym.Env):
         # but some of them are not accessible
         while True:
             self._agent_location = self.np_random.integers(
-                0, self.size, size=2, dtype=int)
+                0, self.size * 2 + 2, size=2, dtype=int)
             x, y = self._agent_location
             if not (x, y) in self.forbidden_area:
                 break
@@ -98,7 +98,7 @@ class EmptyRooms(gym.Env):
         self._target_location = self._agent_location
         while True:
             self._target_location = self.np_random.integers(
-                0, self.size, size=2, dtype=int)
+                0, self.size * 2 + 2, size=2, dtype=int)
             x, y = self._target_location
             if not ((x, y) in self.forbidden_area or np.array_equal(self._target_location, self._agent_location)):
                 break

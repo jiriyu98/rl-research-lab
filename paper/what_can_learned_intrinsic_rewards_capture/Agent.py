@@ -14,9 +14,9 @@ class Agent():
         self.env = env
 
         # some parameters
-        self.episode_max_num = 10000  # max iteration in episode
-        self.episode_num = 1  # episode number -> N in paper
-        self.lifetime_value_step = 2  # n-step trajectory for intrinsic reward udpate
+        self.episode_max_num = 100  # max iteration in episode
+        self.episode_num = 200  # episode number -> N in paper
+        self.lifetime_value_step = 8  # n-step trajectory for intrinsic reward udpate
 
         # misc
         self.policy = Policy(state_space=2, action_space=4)
@@ -25,9 +25,6 @@ class Agent():
         self.gamma = 1.0
         self.intrinsic_reward_h0 = None
         self.lifetime_value_h0 = None
-
-        # saved lifetime
-        self.lifetime_trajectory = []
 
         # optimizer for different parameters
         self.policy_optimizer = optim.Adam(self.policy.parameters())
@@ -78,9 +75,6 @@ class Agent():
             if terminated:
                 break
 
-        # # add to lifetime
-        # self.lifetime_trajectory += trajectory
-
         return trajectory
 
     # train episode (inner loop) and it only updates policy
@@ -114,7 +108,7 @@ class Agent():
 
         return episode_extrinsic_return
 
-    def trainLifetimeValueAndIntrinsicReward(self):
+    def trainLifetimeValueAndIntrinsicReward(self, trajectory):
         # update intrinsic reward
         objective_lifetime_value = 0
         objective_intrinsic_reward = 0
@@ -122,10 +116,10 @@ class Agent():
         sliding_window = deque()
 
         # prepare a sliding window
-        for index in range(min(self.lifetime_value_step, len(self.lifetime_trajectory))):
-            sliding_window.append(self.lifetime_trajectory[index])
+        for index in range(min(self.lifetime_value_step, len(trajectory))):
+            sliding_window.append(trajectory[index])
 
-        for outer_index in range(len(self.lifetime_trajectory)):
+        for outer_index in range(len(trajectory)):
             return_life = 0
 
             assert (len(sliding_window) > 0)
@@ -144,11 +138,11 @@ class Agent():
                         policy_named_parameters_0[name].grad * W.grad).sum().item()
 
             # if it permits, add a lifetime value
-            if outer_index + self.lifetime_value_step < len(self.lifetime_trajectory):
+            if outer_index + self.lifetime_value_step < len(trajectory):
                 assert (len(sliding_window) == self.lifetime_value_step)
 
-                tuple_n = self.lifetime_trajectory[outer_index +
-                                                   self.lifetime_value_step]
+                tuple_n = trajectory[outer_index +
+                                     self.lifetime_value_step]
                 return_life += (self.gamma **
                                 self.lifetime_value_step) * tuple_n["lifetime_value"].item()
                 sliding_window.append(tuple_n)
@@ -182,22 +176,19 @@ class Agent():
         # 1) create running_reward for one life
         running_reward = 0
 
+        # life loop
         for i in count(1):
-            # life preparations:
-            # 1) clear the lifetime trajectory
-            self.lifetime_trajectory.clear()
-
             # step1: sample a new task and a new random policy parameter
             # FIXME: this is not random
             self.policy = Policy(state_space=2, action_space=4)
             seed = np.random.randint(1, 1000)
 
-            # step2: update policy
-            for _ in range(self.episode_num):
+            for j in range(self.episode_num):
+                # step2: update policy (episodic)
+
                 # 1) generate trajectory
                 trajectory = self.generateEpisodeTrajectory(seed)
                 # 2) add to lifetime
-                self.lifetime_trajectory += trajectory
                 # 3) train episode, update policy
                 episode_reward = self.trainEpisode(trajectory)
 
@@ -205,13 +196,13 @@ class Agent():
                 running_reward = 0.05 * episode_reward + \
                     (1 - 0.05) * running_reward
 
-            # step3: update intrinsic reward function
-            # step4: update lifetime value function
-            self.trainLifetimeValueAndIntrinsicReward()
+                # step3: update intrinsic reward function
+                # step4: update lifetime value function
+                self.trainLifetimeValueAndIntrinsicReward(trajectory)
 
-            # if i % 10 == 0:
-            print("Train {} round \t running reward {:.2f} \t the latest episode reward {:.2f} \t the latest episode length {:d}".format(
-                i, running_reward, episode_reward, len(trajectory)))
+                # if i % 10 == 0:
+                print("Life {}, {} episode \t running reward {:.2f}".format(
+                    i, j, running_reward))
 
 
 def main():

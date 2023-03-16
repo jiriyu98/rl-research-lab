@@ -1,6 +1,7 @@
 from collections import deque
 from itertools import count
 
+import matplotlib.pyplot as plt
 import numpy as np
 import torch.optim as optim
 from envs.EmptyRooms import EmptyRooms
@@ -22,7 +23,7 @@ class Agent():
         self.policy = Policy(state_space=2, action_space=4)
         self.intrinsic_rewrd = IntrinsicReward(input_space=5)
         self.lifetime_value = IntrinsicReward(input_space=5)
-        self.gamma = 1.0
+        self.gamma = 0.99
         self.intrinsic_reward_h0 = None
         self.lifetime_value_h0 = None
 
@@ -36,6 +37,9 @@ class Agent():
     def generateEpisodeTrajectory(self, seed):
         # reset the env
         observation, info = self.env.reset(seed=seed)
+        self.env.render()
+        init_observation = observation
+        init_info = info
 
         trajectory = []
 
@@ -75,7 +79,7 @@ class Agent():
             if terminated:
                 break
 
-        return trajectory
+        return trajectory, init_observation, init_info
 
     # train episode (inner loop) and it only updates policy
     def trainEpisode(self, trajectory):
@@ -91,8 +95,10 @@ class Agent():
             intrinsic_reward = tuple["intrinsic_reward"]
             extrinsic_reward = tuple["extrinsic_reward"]
 
-            episode_intrinsic_return += discounted * intrinsic_reward.item()
-            episode_extrinsic_return += discounted * extrinsic_reward
+            episode_intrinsic_return = discounted * \
+                episode_intrinsic_return + intrinsic_reward.item()
+            episode_extrinsic_return = discounted * \
+                episode_extrinsic_return + extrinsic_reward
 
             objective += saved_log * episode_intrinsic_return
             discounted = discounted * self.gamma
@@ -103,7 +109,7 @@ class Agent():
         # update policy
         self.policy_optimizer.zero_grad()
         objective = -objective
-        objective.backward(retain_graph=True)
+        objective.backward()
         self.policy_optimizer.step()
 
         return episode_extrinsic_return
@@ -173,8 +179,9 @@ class Agent():
 
     def trainLife(self):
         # global preparations:
-        # 1) create running_reward for one life
-        running_reward = 0
+
+        record_average_return_y = [0] * self.episode_num
+        record_average_return_x = [i for i in range(self.episode_num)]
 
         # life loop
         for i in count(1):
@@ -182,27 +189,40 @@ class Agent():
             # FIXME: this is not random
             self.policy = Policy(state_space=2, action_space=4)
             seed = np.random.randint(1, 1000)
+            # 1) create running_reward for one life
+            running_reward = 0
 
             for j in range(self.episode_num):
                 # step2: update policy (episodic)
 
                 # 1) generate trajectory
-                trajectory = self.generateEpisodeTrajectory(seed)
+                trajectory, init_observation, init_info = self.generateEpisodeTrajectory(
+                    seed)
                 # 2) add to lifetime
                 # 3) train episode, update policy
-                episode_reward = self.trainEpisode(trajectory)
+                episode_return = self.trainEpisode(trajectory)
 
                 # 4) log
-                running_reward = 0.05 * episode_reward + \
+                running_reward = 0.05 * episode_return + \
                     (1 - 0.05) * running_reward
 
                 # step3: update intrinsic reward function
                 # step4: update lifetime value function
                 self.trainLifetimeValueAndIntrinsicReward(trajectory)
 
-                # if i % 10 == 0:
+                if j == 0:
+                    print("Init observation {} and init info {}".format(
+                        init_observation, init_info))
+
                 print("Life {}, {} episode \t running reward {:.2f}".format(
                     i, j, running_reward))
+
+                record_average_return_y[j] = (
+                    record_average_return_y[j] * (i - 1) + episode_return) / i
+
+                if j % 50 == 0:
+                    plt.plot(record_average_return_x, record_average_return_y)
+                    plt.show()
 
 
 def main():

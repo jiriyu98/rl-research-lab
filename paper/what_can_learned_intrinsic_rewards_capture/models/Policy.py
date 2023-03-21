@@ -6,22 +6,25 @@ from torch.distributions import Categorical
 
 class Policy(nn.Module):
     # CNN
+
+    # ref: https://github.com/pytorch/examples/blob/main/reinforcement_learning/actor_critic.py
     def __init__(self, state_space, action_space):
         super().__init__()
-        self.affine1 = nn.Linear(state_space, 64)
+        self.affine1 = nn.Linear(state_space, 128)
         self.dropout = nn.Dropout(p=0.6)
-        self.affine2 = nn.Linear(64, action_space)
+        self.action_head = nn.Linear(128, action_space)
+        self.value_head = nn.Linear(128, 1)
+
+    def update_parameters(self):
+        None
 
     def forward(self, x):
         x = torch.from_numpy(x).float().unsqueeze(0)
-        x = self.affine1(x)
-        x = self.dropout(x)
-        x = F.relu(x)
-        x = self.affine2(x)
-        x = F.softmax(x, dim=1)
-        m = Categorical(x)
+        x = F.relu(self.dropout(self.affine1(x)))
 
-        action = m.sample()
-        # save the log_prob
+        action_prob = F.softmax(self.action_head(x), dim=1)
+        state_value = self.value_head(x)
+        # m = Categorical(action_prob)
+        # action = m.sample()
 
-        return action, m.log_prob(action)
+        return action_prob, state_value

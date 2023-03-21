@@ -2,14 +2,16 @@ from collections import deque
 from itertools import count
 
 import numpy as np
+import torch
 import torch.optim as optim
 from envs.EmptyRooms import EmptyRooms
+from matplotlib import pyplot as plt
 from models.IntrinsicReward import IntrinsicReward
 from models.Policy import Policy
+from torch.distributions import Categorical
 
 '''
-REINFORCE-episodic
-So there the trajectory is for a whole episode
+Actor-Critic style
 '''
 
 
@@ -24,13 +26,22 @@ class Agent():
         self.lifetime_value = IntrinsicReward(input_space=5)
 
         # hyperparameters
-        self.episode_time_limit = 100
-        self.episode_num_per_lifetime = 200
+        self.episode_step_limit = 100
+        self.episode_num_per_lifetime = 100
+        self.lifetime_done = False
         self.trajectory_length = 8  # n-step trajectory for intrinsic reward udpate
-        self.gamma = 0.99
+        self.outer_gamma = 0.99
+        self.inner_gamma = 0.9
         self.outer_unroll_length = 5
         self.intrinsic_reward_h0 = None
         self.lifetime_value_h0 = None
+        self.seed = None
+
+        # utils
+        self.episode_count = 0
+        self.episode_rewards = []
+        self.episode_returns = []
+        self.episode_step_count = 0
 
         # saved lifetime
         self.lifetime_trajectory = []
@@ -38,197 +49,220 @@ class Agent():
         # optimizer for different parameters
         self.policy_optimizer = optim.Adam(self.policy.parameters())
         self.intrinsic_rewrd_optimizer = optim.Adam(
-            self.intrinsic_rewrd.parameters(), lr=0.001)
+            self.intrinsic_rewrd.parameters())
         self.lifetime_value_optimizer = optim.Adam(
             self.lifetime_value.parameters())
+        self.intrinsic_reward_and_lifeimte_value_optimizer = optim.Adam(
+            list(self.lifetime_value.parameters()) + list(self.intrinsic_rewrd.parameters()))
 
-    def generateEpisodeTrajectory(self, seed):
-        # reset the env
-        observation, info = self.env.reset(seed=seed)
+        # env states
+        self.env_observation = None
+        self.env_info = None
 
+    def selectAction(self, action_prob):
+        m = Categorical(action_prob)
+        action = m.sample()
+        return action.item()
+
+    def generateATrajectory(self):
+        # initialize the start point
+        observation, info = self.env_observation, self.env_info
         trajectory = []
 
-        # prevent repeat forever (avoid epsidoe too long)
-        for _ in range(self.episode_time_limit):
-            action, saved_log = self.policy(observation["agent"])
-            action = action.item()
+        for _ in range(self.trajectory_length + 1):
+            action_prob, _ = self.policy(observation["agent"])
+            action = self.selectAction(action_prob)
             next_observation, extrinsic_reward, terminated, _, info = self.env.step(
                 action)
+            self.episode_rewards.append(extrinsic_reward)
+            self.episode_step_count += 1
 
-            # record in trajctory
-            # XXX: Make it elegant.
-            # RNN
-            terminated = 1 if terminated else 0
-            intrinsic_reward, self.intrinsic_reward_h0 = self.intrinsic_rewrd(
-                (observation["agent"], action, extrinsic_reward, terminated), self.intrinsic_reward_h0)
-            lifetime_value, self.lifetime_value_h0 = self.lifetime_value(
-                (observation["agent"], action, extrinsic_reward, terminated), self.lifetime_value_h0)
-
-            # get policy parameters
-            self.policy_optimizer.zero_grad()
-            saved_log.backward(retain_graph=True)
+            if self.episode_step_count >= self.episode_step_limit:
+                terminated = True
 
             trajectory.append({"observation": observation["agent"],
                                "action": action,
-                               "saved_log": saved_log,
                                "extrinsic_reward": extrinsic_reward,
-                               "intrinsic_reward": intrinsic_reward,
-                               "lifetime_value": lifetime_value,
                                "terminated": terminated,
-                               "policy_named_parameters": {name: w for name, w in self.policy.named_parameters()}
                                })
 
             # prepare for next iteration
             observation = next_observation
 
             if terminated:
-                break
+                self.env_observation, self.env_info = self.env.reset(
+                    seed=self.seed)
+                self.episode_count += 1
 
-        # compute return
-        episode_intrinsic_return = 0
-        episode_extrinsic_return = 0
-        discounted = 1
+                # get episode return
+                episode_return = 0
+                for episode_reward in self.episode_rewards[::-1]:
+                    episode_return = self.outer_gamma * episode_return + episode_reward
 
-        for tuple in trajectory[::-1]:
-            saved_log = tuple["saved_log"]
-            intrinsic_reward = tuple["intrinsic_reward"]
-            extrinsic_reward = tuple["extrinsic_reward"]
+                self.episode_returns.append(episode_return)
+                self.episode_rewards.clear()
+                self.episode_step_count = 0
 
-            episode_intrinsic_return = discounted * \
-                episode_intrinsic_return + intrinsic_reward.item()
-            episode_extrinsic_return = discounted * \
-                episode_extrinsic_return + extrinsic_reward
+        if self.episode_count >= self.episode_num_per_lifetime:
+            self.lifetime_done = True
 
-            discounted = discounted * self.gamma
-
-            tuple["extrinsic_return"] = episode_extrinsic_return
-            tuple["intrinsic_return"] = episode_intrinsic_return
+        self.env_observation = observation
+        self.env_info = info
 
         return trajectory
 
-    # train episode (inner loop) and it only updates policy
-    def trainEpisode(self, trajectory):
-        # update agent/policy
-        objective = 0
-        episode_intrinsic_return = 0
+    def discountedReturnFn(self, trajectory, gamma, bootstrap_value, return_key):
+        # Args:
+        # trajectory: T + 1 length
+        # return_key: can be "extrinsic_reward" or "intrinsic_reward"
 
-        # TODO: Replace "tuple" with a better name
-        for tuple in trajectory[::-1]:
-            saved_log = tuple["saved_log"]
-            episode_intrinsic_return = tuple["extrinsic_return"]
+        returns = []
+        trajectory_return = bootstrap_value
 
-            objective += saved_log * episode_intrinsic_return
+        for index in range(len(trajectory[::-1])):
+            trajectory_return = trajectory_return * \
+                gamma + trajectory[index][return_key]
+            returns.append(trajectory_return)
 
-        # XXX: Probably need to clarify if the objective should be updated with a std...? like REINFORCE
-        # returns = (returns - returns.mean()) / (returns.std() + eps)
+        return returns[::-1]
 
-        # update policy
-        self.policy_optimizer.zero_grad()
-        objective = -objective
-        objective.backward(retain_graph=True)
-        self.policy_optimizer.step()
+    def trainTrajectory(self, trajectory):
+        # Args:
+        # trajectory: T + 1 length
 
-        return trajectory[-1]["extrinsic_return"]
+        # step1) update RNN and state_value, prepare for policy udpate
+        for tuple in trajectory:
+            observation = tuple["observation"]
+            extrinsic_reward = tuple["extrinsic_reward"]
+            action = tuple["action"]
+            terminated = tuple["terminated"]
 
-    def trainLifetimeValueAndIntrinsicReward(self):
-        # update intrinsic reward
-        objective_lifetime_value = 0
-        objective_intrinsic_reward = 0
+            # get intrinsic_reward and lifetime_value
+            intrinsic_reward, self.intrinsic_reward_h0 = self.intrinsic_rewrd(
+                (observation, action, extrinsic_reward, terminated), self.intrinsic_reward_h0)
+            lifetime_value, self.lifetime_value_h0 = self.lifetime_value(
+                (observation, action, extrinsic_reward, terminated), self.lifetime_value_h0)
 
-        sliding_window = deque()
+            _, state_value = self.policy(observation)
+            # add intrinsic_reward and lifetime_value into tuple
+            tuple["intrinsic_reward"] = intrinsic_reward
+            tuple["lifetime_value"] = lifetime_value
+            tuple["state_value"] = state_value.item()
 
-        # prepare a sliding window
-        for index in range(min(self.trajectory_length, len(self.lifetime_trajectory))):
-            sliding_window.append(self.lifetime_trajectory[index])
+        # step2) update policy
+        returns = self.discountedReturnFn(trajectory=trajectory[:-1],
+                                          gamma=self.inner_gamma,
+                                          bootstrap_value=trajectory[-1]["state_value"],
+                                          return_key="intrinsic_reward")
 
-        for outer_index in range(len(self.lifetime_trajectory)):
-            return_life = 0
+        policy_and_value_objective = 0
+        for index in range(self.trajectory_length):
+            action_prob, state_value = self.policy(
+                trajectory[index]["observation"])
+            log_prob = Categorical(action_prob).log_prob(
+                torch.tensor(trajectory[index]["action"]))
 
-            assert (len(sliding_window) > 0)
+            advantage = (returns[index] - state_value).item()
 
-            policy_named_parameters_0 = sliding_window[0]["policy_named_parameters"]
+            policy_loss = (self.inner_gamma ** index) * advantage * log_prob
+            value_loss = advantage * state_value
+            policy_and_value_objective += -policy_loss + value_loss
 
-            # TODO: obviously it could be optimized (not sure if pytorch supports it)
-            for inner_index, tuple in enumerate(sliding_window):
-                return_life += (self.gamma ** inner_index) * \
-                    tuple["extrinsic_reward"]
+        # non-leaf nodes also need gradient
+        # policy_and_value_objective.retain_grad()
 
-                # !!!get the objective_intrinsic_reward!!!
-                for name, W in tuple["policy_named_parameters"].items():
-                    objective_intrinsic_reward += (self.gamma ** inner_index) * tuple["intrinsic_reward"] * (
-                        policy_named_parameters_0[name].grad * W.grad).sum().item()
+        # recomend to use autograd.grad ..?
+        # policy_and_value_objective.backward(create_graph=True)
+        policy_parameter_grads = torch.autograd.grad(policy_and_value_objective,
+                                                     self.policy.parameters(), create_graph=True, allow_unused=True)
 
-            # if it permits, add a lifetime value
-            if outer_index + self.trajectory_length < len(self.lifetime_trajectory):
-                assert (len(sliding_window) == self.trajectory_length)
-
-                tuple_n = self.lifetime_trajectory[outer_index +
-                                                   self.trajectory_length]
-                return_life += (self.gamma **
-                                self.trajectory_length) * tuple_n["lifetime_value"].item()
-                sliding_window.append(tuple_n)
-
-            sliding_window.popleft()
-
-            # calculate objective functions
-            # 1) calculate objective lifetime value
-            lifetime_value = tuple["lifetime_value"]
-            objective_lifetime_value += (return_life -
-                                         lifetime_value.item()) * lifetime_value
-
-            # 2) calculate objective intrinsic reward
-            objective_intrinsic_reward = return_life * objective_intrinsic_reward
-
-        # update intrinsic reward function
-        self.intrinsic_rewrd_optimizer.zero_grad()
-        objective_intrinsic_reward = -objective_intrinsic_reward
-        objective_intrinsic_reward.backward()
-        self.intrinsic_rewrd_optimizer.step()
-
-        self.lifetime_value_optimizer.zero_grad()
-        objective_lifetime_value = -objective_lifetime_value
-        objective_lifetime_value.backward()
-        self.lifetime_value_optimizer.step()
+        # manually update, Adam
+        # Hard Code
+        for grad, param_key in zip(policy_parameter_grads, self.policy._parameters):
+            param = self.policy._parameters[param_key]
+            assert (grad.shape == param.shape)
+            lr = 1e-3
+            m, v = param.detach().clone(), param.detach().clone()
+            m = m + (grad - m) * (1 - .9)
+            # detach()...? the previous work did this operation
+            v = v + torch.square(grad.detach() - v) * (1 - .999)
+            self.policy._parameters[param_key] = param - \
+                m * lr / (torch.sqrt(v) + 1e-5)
 
         return
+
+    # TODO: Complete
+    def trainLifetimeValueAndIntrinsicReward(self, trajectory):
+        returns = self.discountedReturnFn(trajectory=trajectory[:-1],
+                                          gamma=self.outer_gamma,
+                                          bootstrap_value=trajectory[-1]["state_value"],
+                                          return_key="extrinsic_reward")
+
+        intrinsic_reward_and_lifeimte_value_loss = 0
+        for index in range(len(trajectory[:-1])):
+            action_prob, state_value = self.policy(
+                trajectory[index]["observation"])
+            log_prob = Categorical(action_prob).log_prob(
+                torch.tensor(trajectory[index]["action"]))
+
+            advantage = (returns[index] - state_value).item()
+
+            policy_loss = (self.inner_gamma ** index) * advantage * log_prob
+            value_loss = advantage * state_value
+            intrinsic_reward_and_lifeimte_value_loss += -policy_loss + value_loss
+
+        # self.lifetime_value_optimizer.zero_grad()
+        # self.intrinsic_rewrd_optimizer.zero_grad()
+        self.intrinsic_reward_and_lifeimte_value_optimizer.zero_grad()
+        intrinsic_reward_and_lifeimte_value_loss.backward()
+        self.intrinsic_reward_and_lifeimte_value_optimizer.step()
+        # self.lifetime_value_optimizer.step()
+        # self.intrinsic_rewrd_optimizer.step()
+
+        return
+
+    def prepareForLife(self):
+        # life preparations:
+        self.seed = np.random.randint(1, 1000)
+        self.env_observation, self.env_info = self.env.reset(seed=self.seed)
+        print(self.env_observation, self.env_info)
+        # FIXME: this is not random
+        self.policy = Policy(state_space=2, action_space=4)
+        self.episode_count = 0
+        self.episode_step_count = 0
+        self.lifetime_done = False
+        self.episode_rewards.clear()
+        self.episode_returns.clear()
+
+        self.intrinsic_reward_h0 = None
+        self.lifetime_value_h0 = None
 
     def trainLife(self):
         # global preparations:
 
         for i in count(1):
-            # life preparations:
-            # 1) clear the lifetime trajectory
-            self.lifetime_trajectory.clear()
-            # 2) initialize the enviornment
-            seed = np.random.randint(1, 1000)
-            # 3) running reward for one line
-            running_reward = 0
+            self.prepareForLife()
 
-            for j in range(self.episode_num_per_lifetime):
+            while not self.lifetime_done:  # outer loop
                 # step1: sample a new task and a new random policy parameter
-                # FIXME: this is not random
-                self.policy = Policy(state_space=2, action_space=4)
 
-                # step2: update policy
+                trajectories = []
+
+                # step2: update policy (inner loop)
                 for _ in range(self.outer_unroll_length):
-                    # 1) generate trajectory
-                    trajectory = self.generateEpisodeTrajectory(seed)
-                    # 2) add to lifetime
-                    self.lifetime_trajectory += trajectory
-                    # 3) train episode, update policy
-                    episode_reward = self.trainEpisode(trajectory)
-
-                    # 4) log
-                    running_reward = 0.05 * episode_reward + \
-                        (1 - 0.05) * running_reward
+                    # 1) generate a trajectory
+                    trajectory = self.generateATrajectory()
+                    # 2) append it to trajectories
+                    trajectories += trajectory
+                    # 3) train, update policy
+                    self.trainTrajectory(trajectory)
 
                 # step3: update intrinsic reward function
                 # step4: update lifetime value function
-                self.trainLifetimeValueAndIntrinsicReward()
+                self.trainLifetimeValueAndIntrinsicReward(trajectories)
 
-                # if i % 10 == 0:
-                print("Train {} life(s), total episodes {} \t running reward {:.2f} \t".format(
-                    i, j, running_reward))
+            plt.plot(self.episode_returns)
+            plt.show()
 
 
 def main():

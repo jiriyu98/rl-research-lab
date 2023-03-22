@@ -39,7 +39,7 @@ class IntrinsicReward(nn.Module):
 
         x, hn = self.rnn(x, h0)
         x = F.relu(self.affline1(x))
-        x = F.relu(self.affline2(x))
+        x = self.affline2(x)
 
         # intrinsicreward and history info
         return x, hn

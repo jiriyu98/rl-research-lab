@@ -9,10 +9,12 @@ from matplotlib import pyplot as plt
 from models.IntrinsicReward import IntrinsicReward
 from models.Policy import Policy
 from torch.distributions import Categorical
+from torch.nn.utils import clip_grad_norm_
 
 '''
 Actor-Critic style
 '''
+torch.autograd.set_detect_anomaly(True)
 
 
 class Agent():
@@ -22,7 +24,7 @@ class Agent():
 
         # model
         self.policy = Policy(state_space=2, action_space=4)
-        self.intrinsic_rewrd = IntrinsicReward(input_space=5)
+        self.intrinsic_reward = IntrinsicReward(input_space=5)
         self.lifetime_value = IntrinsicReward(input_space=5)
 
         # hyperparameters
@@ -38,22 +40,30 @@ class Agent():
         self.seed = None
 
         # utils
+        self.adam_count = 0
         self.episode_count = 0
         self.episode_rewards = []
+        self.episode_distances = []
         self.episode_returns = []
         self.episode_step_count = 0
+
+        self.adam_m = {}
+        self.adam_v = {}
+
+        for module_name, module in self.policy.named_children():
+            self.adam_m[module_name] = {}
+            self.adam_v[module_name] = {}
+            for name_param, param in module.named_parameters():
+                self.adam_m[module_name][name_param] = torch.zeros_like(param)
+                self.adam_v[module_name][name_param] = torch.zeros_like(param)
 
         # saved lifetime
         self.lifetime_trajectory = []
 
         # optimizer for different parameters
         self.policy_optimizer = optim.Adam(self.policy.parameters())
-        self.intrinsic_rewrd_optimizer = optim.Adam(
-            self.intrinsic_rewrd.parameters())
-        self.lifetime_value_optimizer = optim.Adam(
-            self.lifetime_value.parameters())
         self.intrinsic_reward_and_lifeimte_value_optimizer = optim.Adam(
-            list(self.lifetime_value.parameters()) + list(self.intrinsic_rewrd.parameters()))
+            list(self.lifetime_value.parameters()) + list(self.intrinsic_reward.parameters()))
 
         # env states
         self.env_observation = None
@@ -74,6 +84,7 @@ class Agent():
             action = self.selectAction(action_prob)
             next_observation, extrinsic_reward, terminated, _, info = self.env.step(
                 action)
+            self.episode_distances.append(info["distance"])
             self.episode_rewards.append(extrinsic_reward)
             self.episode_step_count += 1
 
@@ -138,7 +149,7 @@ class Agent():
             terminated = tuple["terminated"]
 
             # get intrinsic_reward and lifetime_value
-            intrinsic_reward, self.intrinsic_reward_h0 = self.intrinsic_rewrd(
+            intrinsic_reward, self.intrinsic_reward_h0 = self.intrinsic_reward(
                 (observation, action, extrinsic_reward, terminated), self.intrinsic_reward_h0)
             lifetime_value, self.lifetime_value_h0 = self.lifetime_value(
                 (observation, action, extrinsic_reward, terminated), self.lifetime_value_h0)
@@ -147,13 +158,14 @@ class Agent():
             # add intrinsic_reward and lifetime_value into tuple
             tuple["intrinsic_reward"] = intrinsic_reward
             tuple["lifetime_value"] = lifetime_value
-            tuple["state_value"] = state_value.item()
+            tuple["state_value"] = state_value
 
         # step2) update policy
         returns = self.discountedReturnFn(trajectory=trajectory[:-1],
                                           gamma=self.inner_gamma,
-                                          bootstrap_value=trajectory[-1]["state_value"],
-                                          return_key="intrinsic_reward")
+                                          bootstrap_value=trajectory[-1]["state_value"].item(
+        ),
+            return_key="intrinsic_reward")
 
         policy_and_value_objective = 0
         for index in range(self.trajectory_length):
@@ -162,62 +174,104 @@ class Agent():
             log_prob = Categorical(action_prob).log_prob(
                 torch.tensor(trajectory[index]["action"]))
 
-            advantage = (returns[index] - state_value).item()
+            advantage = (returns[index] - state_value.item())
 
             policy_loss = (self.inner_gamma ** index) * advantage * log_prob
-            value_loss = advantage * state_value
+            value_loss = advantage.detach() * state_value
             policy_and_value_objective += -policy_loss + value_loss
 
+        # Version 2
         # non-leaf nodes also need gradient
         # policy_and_value_objective.retain_grad()
 
         # recomend to use autograd.grad ..?
+        # UserWarning: Using backward() with create_graph=True will create a reference cycle between the parameter and its gradient which can cause a memory leak. We recommend using autograd.grad when creating the graph to avoid this. If you have to use this function, make sure to reset the .grad fields of your parameters to None after use to break the cycle and avoid the leak.
         # policy_and_value_objective.backward(create_graph=True)
-        policy_parameter_grads = torch.autograd.grad(policy_and_value_objective,
-                                                     self.policy.parameters(), create_graph=True, allow_unused=True)
 
-        # manually update, Adam
-        # Hard Code
-        for grad, param_key in zip(policy_parameter_grads, self.policy._parameters):
-            param = self.policy._parameters[param_key]
-            assert (grad.shape == param.shape)
-            lr = 1e-3
-            m, v = param.detach().clone(), param.detach().clone()
-            m = m + (grad - m) * (1 - .9)
-            # detach()...? the previous work did this operation
-            v = v + torch.square(grad.detach() - v) * (1 - .999)
-            self.policy._parameters[param_key] = param - \
-                m * lr / (torch.sqrt(v) + 1e-5)
+        # for module_name, module in self.policy.named_children():
+        #     clip_grad_norm_(module.parameters(), 0.2)
+        #     for param_key in module._parameters:
+        #         param = module._parameters[param_key]
+        #         grad = param.grad
+
+        #         print(grad.shape)
+
+        #         self.adam_count += 1
+        #         correct1 = 1 - .9 ** self.adam_count
+        #         correct2 = 1 - .999 ** self.adam_count
+
+        #         lr = 1e-3
+        #         m, v = self.adam_m[module_name][param_key], self.adam_v[module_name][param_key]
+        #         m = m + (grad - m) * (1 - .9)
+        #         # detach()...? the previous work did this operation
+        #         v = v + torch.square(grad.detach() - v) * (1 - .999)
+        #         assert (torch.all(v >= 0))
+        #         module._parameters[param_key] = param - \
+        #             m / correct1 * lr / (torch.sqrt(v / correct2) + 1e-5)
+
+        #         print(module._parameters[param_key].shape)
+
+        # Version 1
+
+        # grad will not be in the variable now
+        policy_parameter_grads = torch.autograd.grad(
+            policy_and_value_objective, self.policy.parameters(), create_graph=True)
+
+        # clip_grad_norm_(policy_parameter_grads, 0.2)
+
+        grads = {}
+        for (name, _), grad in zip(self.policy.named_parameters(), policy_parameter_grads):
+            grads[name] = grad
+
+        for module_name, module in self.policy.named_children():
+            for param_key in module._parameters:
+                param = module._parameters[param_key]
+                grad = grads[module_name + '.' + param_key]
+
+                self.adam_count += 1
+                correct1 = 1 - .9 ** self.adam_count
+                correct2 = 1 - .999 ** self.adam_count
+
+                lr = 1e-3
+                m, v = self.adam_m[module_name][param_key], self.adam_v[module_name][param_key]
+                m = m + (grad - m) * (1 - .9)
+                # detach()...? the previous work did this operation
+                v = v + torch.square(grad.detach() - v) * (1 - .999)
+                module._parameters[param_key] = param - \
+                    m / correct1 * lr / (torch.sqrt(v / correct2) + 1e-5)
 
         return
 
-    # TODO: Complete
     def trainLifetimeValueAndIntrinsicReward(self, trajectory):
         returns = self.discountedReturnFn(trajectory=trajectory[:-1],
                                           gamma=self.outer_gamma,
-                                          bootstrap_value=trajectory[-1]["state_value"],
+                                          bootstrap_value=trajectory[-1]["lifetime_value"],
                                           return_key="extrinsic_reward")
 
         intrinsic_reward_and_lifeimte_value_loss = 0
         for index in range(len(trajectory[:-1])):
-            action_prob, state_value = self.policy(
+            action_prob, _ = self.policy(
                 trajectory[index]["observation"])
             log_prob = Categorical(action_prob).log_prob(
                 torch.tensor(trajectory[index]["action"]))
+            lifetime_value = trajectory[index]["lifetime_value"]
 
-            advantage = (returns[index] - state_value).item()
+            advantage = (returns[index].item() - lifetime_value.item())
 
             policy_loss = (self.inner_gamma ** index) * advantage * log_prob
-            value_loss = advantage * state_value
+            value_loss = advantage * lifetime_value
             intrinsic_reward_and_lifeimte_value_loss += -policy_loss + value_loss
 
-        # self.lifetime_value_optimizer.zero_grad()
-        # self.intrinsic_rewrd_optimizer.zero_grad()
         self.intrinsic_reward_and_lifeimte_value_optimizer.zero_grad()
         intrinsic_reward_and_lifeimte_value_loss.backward()
         self.intrinsic_reward_and_lifeimte_value_optimizer.step()
-        # self.lifetime_value_optimizer.step()
-        # self.intrinsic_rewrd_optimizer.step()
+
+        # fix policy
+        for _, module in self.policy.named_children():
+            for param_key in module._parameters:
+                param = module._parameters[param_key]
+                module._parameters[param_key] = param.detach(
+                ).requires_grad_(True)
 
         return
 
@@ -261,11 +315,15 @@ class Agent():
                 # step4: update lifetime value function
                 self.trainLifetimeValueAndIntrinsicReward(trajectories)
 
+                print("episode {} \t latest return {:.2f} \t average dis {:.2f}".format(
+                    self.episode_count, self.episode_returns[-1] if len(self.episode_returns) > 0 else 0, np.average(self.episode_distances)))
+
             plt.plot(self.episode_returns)
             plt.show()
 
 
 def main():
+    emptyRoom = EmptyRooms(render_mode="human")
     emptyRoom = EmptyRooms(render_mode=None)
     agent = Agent(emptyRoom)
 

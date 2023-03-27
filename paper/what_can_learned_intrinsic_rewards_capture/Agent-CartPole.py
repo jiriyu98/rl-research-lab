@@ -206,12 +206,15 @@ class Agent():
                 correct1 = 1 - .9 ** self.adam_count
                 correct2 = 1 - .999 ** self.adam_count
 
-                lr = 1e-3
+                lr = 1e-5
                 m, v = self.adam_m[module_name][param_key], self.adam_v[module_name][param_key]
-                m = m + (grad - m) * (1 - .9)
-                v = v + torch.square(grad.detach() - v) * (1 - .999)
+                m = .9 * m + grad * (1 - .9)
+                v = .999 * v + torch.square(grad) * (1 - .999)
                 module._parameters[param_key] = param - \
-                    m / correct1 * lr / (torch.sqrt(v / correct2) + 1e-5)
+                    m / correct1 * lr / \
+                    (torch.sqrt(v / correct2 + 1e-9) + 1e-5)
+                self.adam_m[module_name][param_key], self.adam_v[module_name][param_key] = m.detach(
+                ), v.detach()
 
         return
 

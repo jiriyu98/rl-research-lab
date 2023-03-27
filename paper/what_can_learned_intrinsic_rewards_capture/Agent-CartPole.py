@@ -2,10 +2,12 @@ from itertools import count
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 import torch.optim as optim
 from envs.CartPole import CartPole
 from matplotlib import pyplot as plt
-from models.IntrinsicRewardAndLifetimeValue import IntrinsicRewardAndLifetimeValue
+from models.IntrinsicRewardAndLifetimeValue import \
+    IntrinsicRewardAndLifetimeValue
 from models.Policy import Policy
 from torch.distributions import Categorical
 
@@ -79,7 +81,7 @@ class Agent():
         observation, info = self.env_observation, self.env_info
         trajectory = []
 
-        for _ in range(self.trajectory_length + 1):
+        for index in range(self.trajectory_length + 1):
             action_prob, _ = self.policy(observation["agent"])
             action = self.selectAction(action_prob)
             next_observation, extrinsic_reward, terminated, _, info = self.env.step(
@@ -94,6 +96,7 @@ class Agent():
                                "action": action,
                                "extrinsic_reward": extrinsic_reward,
                                "terminated": terminated,
+                               "debug_index": index,
                                })
 
             # prepare for next iteration
@@ -112,6 +115,8 @@ class Agent():
                 self.episode_returns.append(episode_return)
                 self.episode_rewards.clear()
                 self.episode_step_count = 0
+
+                break
 
         if self.episode_count >= self.episode_num_per_lifetime:
             self.lifetime_done = True
@@ -136,11 +141,11 @@ class Agent():
 
         return returns[::-1]
 
-    def trainTrajectory(self, trajectory):
+    def feedToRNN(self, trajectory):
         # Args:
         # trajectory: T + 1 length
 
-        # step1) update RNN and state_value, prepare for policy udpate
+        # update RNN and state_value, prepare for policy udpate
         for tuple in trajectory:
             observation = tuple["observation"]
             extrinsic_reward = tuple["extrinsic_reward"]
@@ -157,25 +162,32 @@ class Agent():
             tuple["lifetime_value"] = lifetime_value
             tuple["state_value"] = state_value
 
-        # step2) update policy
-        bootstrap_value = trajectory[-1]["state_value"].item()
+    def trainTrajectory(self, trajectory):
+        # Args:
+        # trajectory: T + 1 length
+
+        # update policy
+        bootstrap_value = trajectory[-1]["state_value"] if not trajectory[-1]["terminated"] else torch.zeros_like(
+            trajectory[-1]["state_value"])
         returns = self.discountedReturnFn(trajectory=trajectory[-2::-1],  # drop the last one
                                           gamma=self.inner_gamma,
                                           bootstrap_value=bootstrap_value,
-                                          reward_key="intrinsic_reward")
+                                          reward_key="extrinsic_reward")
 
         policy_and_value_objective = 0
-        for index in range(self.trajectory_length):
+        for index in range(len(trajectory) - 1):
             action_prob, state_value = self.policy(
                 trajectory[index]["observation"])
             log_prob = Categorical(action_prob).log_prob(
                 torch.tensor(trajectory[index]["action"]))
 
-            advantage = (returns[index] - state_value.item())
+            advantage = (returns[index] - state_value)
 
-            policy_loss = (self.inner_gamma ** index) * advantage * log_prob
-            value_loss = advantage.detach() * state_value
-            policy_and_value_objective += -policy_loss - value_loss
+            policy_loss = (self.inner_gamma ** index) * \
+                advantage * log_prob
+            value_loss = F.smooth_l1_loss(
+                returns[index], state_value)
+            policy_and_value_objective += -policy_loss + value_loss
 
         # grad will not be in the variable now
         policy_parameter_grads = torch.autograd.grad(
@@ -194,7 +206,7 @@ class Agent():
                 correct1 = 1 - .9 ** self.adam_count
                 correct2 = 1 - .999 ** self.adam_count
 
-                lr = 3e-2
+                lr = 1e-3
                 m, v = self.adam_m[module_name][param_key], self.adam_v[module_name][param_key]
                 m = m + (grad - m) * (1 - .9)
                 v = v + torch.square(grad.detach() - v) * (1 - .999)
@@ -210,17 +222,18 @@ class Agent():
                                           reward_key="extrinsic_reward")
 
         intrinsic_reward_and_lifeimte_value_loss = 0
-        for index in range(len(trajectory[:-1])):
+        for index in range(len(trajectory) - 1):
             action_prob, _ = self.policy(
                 trajectory[index]["observation"])
             log_prob = Categorical(action_prob).log_prob(
                 torch.tensor(trajectory[index]["action"]))
             lifetime_value = trajectory[index]["lifetime_value"]
-            advantage = (returns[index].item() - lifetime_value.item())
+            advantage = (returns[index] - lifetime_value)
 
-            policy_loss = (self.inner_gamma ** index) * advantage * log_prob
-            value_loss = advantage * lifetime_value
-            intrinsic_reward_and_lifeimte_value_loss += -policy_loss - value_loss
+            policy_loss = (self.inner_gamma ** index) * \
+                advantage.detach() * log_prob
+            value_loss = F.smooth_l1_loss(returns[index], lifetime_value)
+            intrinsic_reward_and_lifeimte_value_loss += -policy_loss + value_loss
 
         self.intrinsic_reward_and_lifeimte_value_optimizer.zero_grad()
         intrinsic_reward_and_lifeimte_value_loss.backward()
@@ -268,7 +281,14 @@ class Agent():
                     trajectory = self.generateATrajectory()
                     # 2) append it to trajectories
                     trajectories += trajectory
-                    # 3) train, update policy
+                    # 3) feed to RNN
+                    self.feedToRNN(trajectory)
+
+                    # if there is only 1 transition, only add it to lifetime
+                    # that happens at the last transition. -> terminated = True
+                    if len(trajectory) == 1:
+                        continue
+                    # 4) train, update policy
                     self.trainTrajectory(trajectory)
 
                 # step3: update intrinsic reward function

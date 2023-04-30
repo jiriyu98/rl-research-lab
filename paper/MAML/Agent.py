@@ -11,6 +11,7 @@ from torch.distributions import Categorical
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+device = torch.device("cpu")
 
 # ref: https://github.com/GauravIyer/MAML-Pytorch/blob/master/Experiment%201/Experiment_1_Sine_Regression.ipynb
 
@@ -142,16 +143,17 @@ class CusMAML():
         self.num_tasks_meta = num_metatasks
         self.meta_optimiser = torch.optim.Adam(self.weights, self.beta)
         self.meta_losses = []
-        self.print_every = 10
+        self.print_every = 100
         self.num_metatasks = num_metatasks
         self.gamma = 0.99
         self.path_maml_net = "./param/parametes_MAML"
 
     def saveMAML(self):
-        torch.save(self.net.state_dict(), self.path_maml_net)
+        torch.save(self.weights, self.path_maml_net)
 
     def loadMAML(self):
-        self.net.load_state_dict(torch.load(self.path_maml_net))
+        self.weights = torch.load(self.path_maml_net)
+        self.meta_optimiser = torch.optim.Adam(self.weights, self.beta)
 
     def getLoss(self, rollout):
         discounted_return = 0
@@ -226,12 +228,57 @@ class CusMAML():
                       num_epochs, total_loss / self.print_every, average_return / self.print_every))
                 total_loss = 0
                 average_return = 0
+                self.saveMAML()
+
+    def adaptToNewTask(self):
+        task = self.tasks.sample_task(self.net)
+
+        average_return = 0
+        for _ in range(self.print_every):
+            rollout = task.sample_data(self.weights)
+            discounted_return, _ = self.getLoss(rollout)
+            average_return += discounted_return
+        print("discounted_return: {}".format(
+            discounted_return / self.print_every))
+
+        task.env.render()
+        input()
+
+        # 3 shots
+        for _ in range(100):
+            loss = 0
+            for _ in range(20):
+                rollout = task.sample_data(self.weights)
+                _, policy_loss = self.getLoss(rollout)
+                loss += policy_loss
+            self.meta_optimiser.zero_grad()
+            loss.backward()
+            self.meta_optimiser.step()
+
+        average_return = 0
+        for _ in range(self.print_every):
+            rollout = task.sample_data(self.weights)
+            discounted_return, _ = self.getLoss(rollout)
+            average_return += discounted_return
+        print("discounted_return: {}".format(
+            discounted_return / self.print_every))
+
+# train
 
 
-tasks = FrozenLakeDistribution()
+# tasks = FrozenLakeDistribution()
+# net = PolicyNet()
+# net = net.to(device)
+# maml = CusMAML(net, alpha=0.01, beta=0.001,
+#                tasks=tasks, k=5, num_metatasks=10)
+# maml.outer_loop(num_epochs=5000)
+# maml.saveMAML()
+
+# adaption
+
 net = PolicyNet()
-net = net.to(device)
+tasks = FrozenLakeDistribution()
 maml = CusMAML(net, alpha=0.01, beta=0.001,
                tasks=tasks, k=5, num_metatasks=10)
-maml.outer_loop(num_epochs=500)
-maml.saveMAML()
+maml.loadMAML()
+maml.adaptToNewTask()

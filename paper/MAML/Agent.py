@@ -120,6 +120,7 @@ class PolicyNet(nn.Module):
 
     def argforward(self, x, weights):
         x = torch.tensor(x, dtype=torch.float).unsqueeze(0).unsqueeze(0)
+        x = x.to(device)
         x = F.linear(x, weights[0], weights[1])
         x = F.relu(x)
         x = F.linear(x, weights[2], weights[3])
@@ -158,7 +159,7 @@ class CusMAML():
         policy_loss = []
         for index in range(len(returns)):
             log_prob, R = Categorical(rollout[index]["action_prob"]).log_prob(
-                torch.tensor(rollout[index]["action"])), returns[index]
+                torch.tensor(rollout[index]["action"]).to(device)), returns[index]
             policy_loss.append(-log_prob * R)
 
         policy_loss = torch.cat(policy_loss).sum()
@@ -225,4 +226,4 @@ net = PolicyNet()
 net = net.to(device)
 maml = CusMAML(net, alpha=0.01, beta=0.001,
                tasks=tasks, k=5, num_metatasks=10)
-maml.outer_loop(num_epochs=500)
+maml.outer_loop(num_epochs=5000)

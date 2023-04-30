@@ -65,19 +65,20 @@ class FrozenLakeSingleTask():
     def selectAction(self, action_prob):
         m = Categorical(action_prob)
         action = m.sample()
-        return action.item()
+        return action.item(), m.log_prob(action)
 
     def sample_data(self, weight, size=100):
         rollout = []
         observation = self.env.reset()
         for i in range(size):
             action_prob = self.net.argforward(observation, weight)
-            action = self.selectAction(action_prob)
+            action, log_prob = self.selectAction(action_prob)
             next_observation, extrinsic_reward, terminated, _ = self.env.step(
                 action)
 
             rollout.append({"observation": observation,
                             "action_prob": action_prob,
+                            "log_prob": log_prob,
                             "action": action,
                             "extrinsic_reward": extrinsic_reward,
                             "terminated": terminated,
@@ -141,9 +142,16 @@ class CusMAML():
         self.num_tasks_meta = num_metatasks
         self.meta_optimiser = torch.optim.Adam(self.weights, self.beta)
         self.meta_losses = []
-        self.print_every = 100
+        self.print_every = 10
         self.num_metatasks = num_metatasks
         self.gamma = 0.99
+        self.path_maml_net = "./param/parametes_MAML"
+
+    def saveMAML(self):
+        torch.save(self.net.state_dict(), self.path_maml_net)
+
+    def loadMAML(self):
+        self.net.load_state_dict(torch.load(self.path_maml_net))
 
     def getLoss(self, rollout):
         discounted_return = 0
@@ -158,8 +166,7 @@ class CusMAML():
 
         policy_loss = []
         for index in range(len(returns)):
-            log_prob, R = Categorical(rollout[index]["action_prob"]).log_prob(
-                torch.tensor(rollout[index]["action"]).to(device)), returns[index]
+            log_prob, R = rollout[index]["log_prob"], returns[index]
             policy_loss.append(-log_prob * R)
 
         policy_loss = torch.cat(policy_loss).sum()
@@ -226,4 +233,5 @@ net = PolicyNet()
 net = net.to(device)
 maml = CusMAML(net, alpha=0.01, beta=0.001,
                tasks=tasks, k=5, num_metatasks=10)
-maml.outer_loop(num_epochs=5000)
+maml.outer_loop(num_epochs=500)
+maml.saveMAML()

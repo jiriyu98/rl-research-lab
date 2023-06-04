@@ -4,3 +4,4 @@
 *.npy
 *.npz
 *.png
+paper/MAML/param/

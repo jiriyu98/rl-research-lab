@@ -8,6 +8,7 @@ from collections import OrderedDict
 import matplotlib.pyplot as plt
 
 from torch.distributions import Categorical
+# from gym.envs.toy_text.frozen_lake import generate_random_map
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -44,18 +45,25 @@ def generate_random_map(size=8, p=0.8):
                         frontier.append((r_new, c_new))
         return False
 
+    def random_choice_unrepeatable(matrix, num):
+        rows, cols = size, size
+        avaliable_positions = [(row, col) for row in range(rows)
+                               for col in range(cols) if matrix[row][col] == 'F']
+        return [avaliable_positions[x] for x in np.random.choice(len(avaliable_positions), 2, replace=False)]
+
     while not valid:
         p = min(1, p)
+        # res = np.random.choice(["F", "H"], (size, size), p=[p, 1 - p])
         # res = np.random.choice(["F", "H"], (size, size), p=[p, 1 - p])
         res = ["SFFF", "FHFH", "FFFH", "HFFF"]
         res = [list(x) for x in res]
 
-        g_x, g_y = np.random.choice(size, 2)
-        if (g_x == 0 and g_y == 0) or res[g_x][g_y] == 'H':
-            continue
+        (s_x, s_y), (g_x, g_y) = random_choice_unrepeatable(res, 2)
 
+        res[s_x][s_y] = "S"
         res[g_x][g_y] = "G"
         valid = is_valid(res)
+
     return ["".join(x) for x in res]
 
 
@@ -152,7 +160,7 @@ class CusMAML():
         self.print_every = 100
         self.num_metatasks = num_metatasks
         self.gamma = 0.99
-        self.path_maml_net = "./param/parametes_MAML2"
+        self.path_maml_net = "./param/parametes_MAML_random_s_and_g"
 
     def saveMAML(self):
         torch.save(self.weights, self.path_maml_net)
@@ -378,6 +386,7 @@ class CusMAML():
             average_returns.append((average_return_prev, average_return_post,
                                    average_return_prev_vanilla, average_return_post_vanilla))
 
+        print(average_returns)
         for x, label in zip(zip(*average_returns), labels):
             plt.scatter(np.arange(len(descs)), x, label=label)
 
@@ -426,21 +435,19 @@ class CusMAML():
 # train
 
 
-tasks = FrozenLakeDistribution()
-net = PolicyNet()
-net = net.to(device)
-maml = CusMAML(net, alpha=0.01, beta=0.001,
-               tasks=tasks, k=5, num_metatasks=10)
-count_map = np.zeros((4, 4,))
-maml.outer_loop(num_epochs=5000, count_map=count_map)
-maml.saveMAML()
+# tasks = FrozenLakeDistribution()
+# net = PolicyNet()
+# net = net.to(device)
+# maml = CusMAML(net, alpha=0.01, beta=0.001,
+#                tasks=tasks, k=5, num_metatasks=10)
+# count_map = np.zeros((4, 4,))
+# maml.outer_loop(num_epochs=5000, count_map=count_map)
+# maml.saveMAML()
 
 # adaption
 
-# net = PolicyNet()
-# tasks = FrozenLakeDistribution()
-# maml = CusMAML(net, alpha=0.01, beta=0.001,
-#                tasks=tasks, k=5, num_metatasks=10)
-
-# maml.heatmap(count_map, cmap="YlGn", cbarlabel="visitcount")
-# maml.adaptToEveryTask()
+net = PolicyNet()
+tasks = FrozenLakeDistribution()
+maml = CusMAML(net, alpha=0.01, beta=0.001,
+               tasks=tasks, k=5, num_metatasks=10)
+maml.adaptToEveryTask()

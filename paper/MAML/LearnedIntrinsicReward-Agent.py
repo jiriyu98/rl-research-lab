@@ -174,7 +174,7 @@ class IntrinsicRewardAndLifetimeValue(nn.Module):
         self.action_dim = 4
 
         self.net = nn.Sequential(OrderedDict([
-            ('lstm', nn.RNN(self.observation_dim +
+            ('lstm', nn.LSTM(self.observation_dim +
              self.action_dim + 1 + 1, self.rnn_hidden_size)),
             ('relu1', nn.ReLU()),
             ('l2', nn.Linear(self.rnn_hidden_size, 128)),
@@ -182,7 +182,7 @@ class IntrinsicRewardAndLifetimeValue(nn.Module):
             ('l3', nn.Linear(128, 2)),
         ]))
 
-    def forward(self, input, hidden_state=None):
+    def forward(self, input, hidden_state=(None, None)):
         # input adjust
         s0, a0, r1, d1 = input
 
@@ -200,23 +200,24 @@ class IntrinsicRewardAndLifetimeValue(nn.Module):
         # cat all the input
         x = torch.cat((s0, a0, r1, d1), 1)
 
-        if hidden_state is None:
-            h0 = self.initHidden()
+        if hidden_state == (None, None):
+            h0, c0 = self.initHidden()
         else:
-            h0 = hidden_state
+            h0, c0 = hidden_state
 
         h0 = h0.detach()
+        c0 = c0.detach()
 
         # split
-        rnn, fc = self.net[0], self.net[1:]
-        x, hn = rnn(x, h0)
+        lstm, fc = self.net[0], self.net[1:]
+        x, (hn, cn) = lstm(x, (h0, c0))
         intrinsic_reward, lifetime_value = fc(x).squeeze(0)
 
         # intrinsicreward and history info
-        return intrinsic_reward, lifetime_value, hn
+        return intrinsic_reward, lifetime_value, (hn, cn)
 
     def initHidden(self):
-        return torch.zeros((1, self.rnn_hidden_size))
+        return torch.zeros((1, self.rnn_hidden_size)), torch.zeros((1, self.rnn_hidden_size))
 
 # agent
 
@@ -235,6 +236,7 @@ class Agent():
         # IntrinsicRewardAndLifetimeValue
         self.intrinsic_reward_and_lifetime_value = IntrinsicRewardAndLifetimeValue()
         self.h0 = None
+        self.c0 = None
         self.opt = torch.optim.Adam(
             self.intrinsic_reward_and_lifetime_value.parameters(), 0.001)
         self.alpha = 0.01
@@ -280,8 +282,8 @@ class Agent():
                 obs, action, exr, term = trans["observation"], trans[
                     "action"], trans["extrinsic_reward"], trans["terminated"]
 
-                intrinsic_reward, _, self.h0 = self.intrinsic_reward_and_lifetime_value(
-                    (obs, action, exr, term), self.h0)
+                intrinsic_reward, _, (self.h0, self.c0) = self.intrinsic_reward_and_lifetime_value(
+                    (obs, action, exr, term), (self.h0, self.c0))
                 intrinsic_rewards.append(intrinsic_reward)
 
             # logits
@@ -344,7 +346,7 @@ class Agent():
                     "action"], trans["extrinsic_reward"], trans["terminated"]
 
                 _, lifetime_value, _ = self.intrinsic_reward_and_lifetime_value(
-                    (obs, action, exr, term), self.h0)
+                    (obs, action, exr, term), (self.h0, self.c0))
                 lifetime_values.append(lifetime_value)
 
             # logits

@@ -113,7 +113,7 @@ class FrozenLakeSingleTask():
 
         return episode
 
-    def getRollouts(self, size, length_trajectory, N, policy):
+    def getRollouts(self, size, length_trajectory, N, policy, episode_limit):
         # size: episode length limit
         # weight: policy weight
         # length_trajectory: length of rollout (trajectory)
@@ -122,7 +122,7 @@ class FrozenLakeSingleTask():
 
         episode_count = 0
 
-        while len(rollouts) < N:
+        while len(rollouts) < N and episode_count < episode_limit:
             episode = self.generateEpisode(policy, size)
             episode_count += 1
             length_episode = len(episode)
@@ -174,7 +174,7 @@ class IntrinsicRewardAndLifetimeValue(nn.Module):
         self.action_dim = 4
 
         self.net = nn.Sequential(OrderedDict([
-            ('rnn', nn.RNN(self.observation_dim +
+            ('lstm', nn.RNN(self.observation_dim +
              self.action_dim + 1 + 1, self.rnn_hidden_size)),
             ('relu1', nn.ReLU()),
             ('l2', nn.Linear(self.rnn_hidden_size, 128)),
@@ -224,12 +224,13 @@ class IntrinsicRewardAndLifetimeValue(nn.Module):
 class Agent():
     def __init__(self) -> None:
         self.env_dist = FrozenLakeDistribution()
-        self.lifetime_limit = 200
+        self.lifetime_episode_limit = 200
+        self.lifetime_episode_left = 200
         self.episode_length_limit = 20
         self.trajectory_length = 8  # trajectory length (T)
         self.rollouts_number = 5  # outer unroll length (N)
 
-        self.lifetime_train_batch = 20
+        self.lifetime_train_batch = 40
 
         # IntrinsicRewardAndLifetimeValue
         self.intrinsic_reward_and_lifetime_value = IntrinsicRewardAndLifetimeValue()
@@ -239,7 +240,7 @@ class Agent():
         self.alpha = 0.01
 
         self.print_every = 200
-        self.gradient_update_count = 0
+        self.total_episode_count = 0
         self.count_map = np.zeros((4, 4,))
 
     def policy_gradient_loss_fn(self, trajectory, values, logits, discounted_returns):
@@ -263,14 +264,13 @@ class Agent():
 
     def inner_loop(self, task: FrozenLakeSingleTask, policy: PolicyNet):
         rollouts, episode_count = task.getRollouts(
-            self.episode_length_limit, self.trajectory_length, self.rollouts_number, policy)
+            self.episode_length_limit, self.trajectory_length, self.rollouts_number, policy, self.lifetime_episode_left)
+        self.lifetime_episode_left -= episode_count
+        self.total_episode_count += episode_count
 
-        # rollouts, N * T = rollouts_number * trajectory_length
-        # assert (len(rollouts) == self.rollouts_number)
-        # assert (len(rollouts[0]) == self.trajectory_length)
+        # rollouts can be in many shapes so there is no check/assert
 
-        for i in range(self.rollouts_number):
-            rollout = rollouts[i]
+        for rollout in rollouts:
             rollout_length = len(rollout)
 
             # rnn
@@ -317,7 +317,7 @@ class Agent():
                 policy.named_parameters(), policy_parameter_grads)}
             policy.load_state_dict(weights)
 
-        return episode_count, rollouts
+        return rollouts
 
     def outer_loop(self):
         # init a policy
@@ -326,11 +326,9 @@ class Agent():
         task = self.env_dist.sample_task()
 
         # outer loop
-        lifetime_count = 0
-        while lifetime_count <= self.lifetime_limit:
-            episode_count, rollouts = self.inner_loop(task, policy)
-            lifetime_count += episode_count
-            self.gradient_update_count += 1
+        self.lifetime_episode_left = self.lifetime_episode_limit
+        while self.lifetime_episode_left > 0:
+            rollouts = self.inner_loop(task, policy)
 
             # update intrinsic reward and lifetime value
             rollout = []
@@ -388,12 +386,21 @@ class Agent():
                 self.count_map[(lambda x: (x // 4, x % 4))
                                (trans["observation"])] += 1
 
-            if self.gradient_update_count % self.print_every == 0:
-                self.heatmap(self.count_map, name="after {} gradient updates.png".format(
-                    self.gradient_update_count), cmap="YlGn", cbarlabel="visitcount")
+            if self.total_episode_count % self.lifetime_episode_limit == 0:
+                self.heatmap(self.count_map, name="after {} episodes.png".format(
+                    self.total_episode_count), cmap="YlGn", cbarlabel="visitcount")
                 self.count_map = np.zeros((4, 4,))
+                print("{}/{}. loss: {:.3f}, average_return: ".format(self.total_episode_count,
+                      self.lifetime_episode_limit * self.lifetime_train_batch, loss.item()))
+
+    def test(self):
+        pass
+
+    def get_average_return(self):
+        pass
 
     def train(self):
+        self.total_episode_count = 0
         for _ in range(1, self.lifetime_train_batch+1):
             self.outer_loop()
 

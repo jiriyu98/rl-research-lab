@@ -6,6 +6,7 @@ import torch.nn.functional as F
 import numpy as np
 from collections import OrderedDict
 import matplotlib.pyplot as plt
+from matplotlib import colors
 
 from torch.distributions import Categorical
 # from gym.envs.toy_text.frozen_lake import generate_random_map
@@ -57,7 +58,7 @@ def generate_random_map(size=8, p=0.8):
         p = min(1, p)
         # res = np.random.choice(["F", "H"], (size, size), p=[p, 1 - p])
         # res = np.random.choice(["F", "H"], (size, size), p=[p, 1 - p])
-        res = ["SFFF", "FHFH", "FFFH", "HFFF"]
+        res = ["FFFF", "FHFH", "FFFH", "HFFF"]
         res = [list(x) for x in res]
 
         (s_x, s_y), (g_x, g_y) = random_choice_unrepeatable(res, 2)
@@ -79,6 +80,10 @@ class FrozenLakeSingleTask():
         # outer discount factor (extrinsic reward)
         self.outer_task_discount = 0.99
 
+    def render(self):
+        self.env.reset()
+        print(self.env.render("ansi"))
+
     def selectAction(self, action_prob):
         m = Categorical(action_prob)
         action = m.sample()
@@ -89,7 +94,7 @@ class FrozenLakeSingleTask():
         observation = self.env.reset()
         for _ in range(size):
             action_prob = policy(observation)
-            action, log_prob = self.selectAction(action_prob)
+            action, _ = self.selectAction(action_prob)
             next_observation, extrinsic_reward, terminated, _ = self.env.step(
                 action)
 
@@ -99,6 +104,7 @@ class FrozenLakeSingleTask():
             episode.append({"observation": observation,
                             "action": action,
                             "extrinsic_reward": extrinsic_reward,
+                            "next_observation": next_observation,
                             "terminated": terminated,
                             "inner_lifetime_mask": self.inner_lifetime_mask,
                             "outer_lifetime_mask": self.outer_lifetime_mask,
@@ -238,12 +244,18 @@ class Agent():
         self.h0 = None
         self.c0 = None
         self.opt = torch.optim.Adam(
-            self.intrinsic_reward_and_lifetime_value.parameters(), 0.001)
+            self.intrinsic_reward_and_lifetime_value.parameters(), 0.01)
         self.alpha = 0.01
 
         self.print_every = 200
         self.total_episode_count = 0
         self.count_map = np.zeros((4, 4,))
+
+    def save_intrinsic_reward(self):
+        pass
+
+    def load_intrinsic_reward(self):
+        pass
 
     def policy_gradient_loss_fn(self, trajectory, values, logits, discounted_returns):
         trajectory_length = len(trajectory)
@@ -321,12 +333,7 @@ class Agent():
 
         return rollouts
 
-    def outer_loop(self):
-        # init a policy
-        policy = PolicyNet()
-        # init a task
-        task = self.env_dist.sample_task()
-
+    def outer_loop(self, policy, task):
         # outer loop
         self.lifetime_episode_left = self.lifetime_episode_limit
         while self.lifetime_episode_left > 0:
@@ -384,34 +391,91 @@ class Agent():
             loss.backward()
             self.opt.step()
 
-            for trans in rollout:
+            # log
+            for transition in rollout:
                 self.count_map[(lambda x: (x // 4, x % 4))
-                               (trans["observation"])] += 1
+                               (transition["observation"])] += 1
+                if transition["terminated"] and transition["extrinsic_reward"] > 0:
+                    self.count_map[(lambda x: (x // 4, x % 4))(
+                        transition["next_observation"])] += 1
 
-            if self.total_episode_count % self.lifetime_episode_limit == 0:
-                self.heatmap(self.count_map, name="after {} episodes.png".format(
-                    self.total_episode_count), cmap="YlGn", cbarlabel="visitcount")
-                self.count_map = np.zeros((4, 4,))
-                print("{}/{}. loss: {:.3f}, average_return: ".format(self.total_episode_count,
-                      self.lifetime_episode_limit * self.lifetime_train_batch, loss.item()))
+        if self.total_episode_count % self.lifetime_episode_limit == 0:
+            self.heatmap(self.count_map, task, name="after {} episodes.png".format(
+                self.total_episode_count), cmap="YlGn", cbarlabel="visitcount")
+            self.count_map = np.zeros((4, 4,))
+            print("{}/{}. loss: {:.3f}".format(self.total_episode_count,
+                                               self.lifetime_episode_limit * self.lifetime_train_batch, loss.item()))
+
+    def reset(self):
+        self.lifetime_episode_left = self.lifetime_episode_limit
+        self.total_episode_count = 0
 
     def test(self):
-        pass
+        descs = [
+            ["SFFF", "FHFH", "FFFH", "HFFG"],
+            ["SFFF", "FHFH", "FFFH", "HFGF"],
+            ["SFFF", "FHFH", "FFFH", "HGFF"],
+            ["SFFF", "FHFH", "FFGH", "HFFF"],
+            ["SFFF", "FHFH", "FGFH", "HFFF"],
+            ["SFFF", "FHFH", "GFFH", "HFFF"],
+            ["SFFF", "FHGH", "FFFH", "HFFF"],
+            ["SFFF", "GHFH", "FFFH", "HFFF"],
+            ["SFFG", "FHFH", "FFFH", "HFFF"],
+            ["SFGF", "FHFH", "FFFH", "HFFF"],
+            ["SGFF", "FHFH", "FFFH", "HFFF"],
+        ]
+        self.total_episode_count = 0
+        for desc in descs:
+            # init a policy
+            policy = PolicyNet()
+            # init a task
+            task = FrozenLakeSingleTask(desc)
+            self.get_average_return(policy, task, "before training")
+            self.outer_loop(policy, task)
+            self.get_average_return(policy, task, "after training")
+            print()
 
-    def get_average_return(self):
-        pass
+    def get_average_return(self, policy: PolicyNet, task: FrozenLakeSingleTask, output_str):
+        average_return = 0
+
+        total_count = self.lifetime_episode_limit
+
+        for _ in range(total_count):
+            episode = task.generateEpisode(policy)
+            discounted_return = sum(x["extrinsic_reward"] for x in episode)
+            average_return += discounted_return
+        print("{} - discounted_return: {:.3f}".format(output_str,
+                                                      average_return / total_count))
 
     def train(self):
         self.total_episode_count = 0
         for _ in range(1, self.lifetime_train_batch+1):
-            self.outer_loop()
+            # init a policy
+            policy = PolicyNet()
+            # init a task
+            task = self.env_dist.sample_task()
+            self.outer_loop(policy, task)
 
-    def heatmap(self, data, name="temp", row_labels=None, col_labels=None, ax=None, cbar_kw=None, cbarlabel="", **kwargs):
+    def heatmap(self, data, task, name="temp", row_labels=None, col_labels=None, ax=None, cbar_kw=None, cbarlabel="", **kwargs):
         if ax is None:
-            ax = plt.gca()
+            # ax = plt.gca()
+            _, (_, ax) = plt.subplots(1, 2)
 
         if cbar_kw is None:
             cbar_kw = {}
+
+        desc = task.env.desc.copy().tolist()
+        desc_dict = {b'S': 0, b'F': 1, b'H': 2, b'G': 3}
+        m, n = len(desc), len(desc[0])
+        for i in range(m):
+            for j in range(n):
+                desc[i][j] = desc_dict[desc[i][j]]
+        desc = np.array(desc)
+        cmap = colors.ListedColormap(['green', 'white', 'black', 'blue'])
+        ax_task = plt.subplot(121)
+        ax_task.get_xaxis().set_visible(False)
+        ax_task.get_yaxis().set_visible(False)
+        ax_task.imshow(desc, cmap=cmap)
 
         # Plot the heatmap
         im = ax.imshow(data, **kwargs)
@@ -445,4 +509,4 @@ class Agent():
 
 
 agent = Agent()
-agent.train()
+agent.test()

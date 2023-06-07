@@ -55,7 +55,7 @@ def generate_random_map(size=8, p=0.8):
         p = min(1, p)
         # res = np.random.choice(["F", "H"], (size, size), p=[p, 1 - p])
         # res = np.random.choice(["F", "H"], (size, size), p=[p, 1 - p])
-        res = ["SFFF", "FHFH", "FFFH", "HFFF"]
+        res = ["FFFF", "FHFH", "FFFH", "HFFF"]
         res = [list(x) for x in res]
 
         (s_x, s_y), (g_x, g_y) = random_choice_unrepeatable(res, 2)
@@ -90,6 +90,7 @@ class FrozenLakeSingleTask():
                 extrinsic_reward = -0.01
 
             rollout.append({"observation": observation,
+                            "next_observation": next_observation,
                             "action_prob": action_prob,
                             "log_prob": log_prob,
                             "action": action,
@@ -157,7 +158,7 @@ class CusMAML():
         self.k = k
         self.num_tasks_meta = num_metatasks
         self.meta_optimiser = torch.optim.Adam(self.weights, self.beta)
-        self.print_every = 100
+        self.print_every = 4
         self.num_metatasks = num_metatasks
         self.gamma = 0.99
         self.path_maml_net = "./param/parametes_MAML_random_s_and_g"
@@ -202,6 +203,9 @@ class CusMAML():
             if count_map is not None:
                 for transition in rollout:
                     count_map[to_index(transition["observation"])] += 1
+                    if transition["terminated"] and transition["extrinsic_reward"] > 0:
+                        count_map[to_index(
+                            transition["next_observation"])] += 1
 
             discounted_return, loss = self.getLoss(rollout)
             discounted_return_sum += discounted_return / self.k
@@ -435,19 +439,19 @@ class CusMAML():
 # train
 
 
-# tasks = FrozenLakeDistribution()
-# net = PolicyNet()
-# net = net.to(device)
-# maml = CusMAML(net, alpha=0.01, beta=0.001,
-#                tasks=tasks, k=5, num_metatasks=10)
-# count_map = np.zeros((4, 4,))
-# maml.outer_loop(num_epochs=5000, count_map=count_map)
-# maml.saveMAML()
+tasks = FrozenLakeDistribution()
+net = PolicyNet()
+net = net.to(device)
+maml = CusMAML(net, alpha=0.01, beta=0.001,
+               tasks=tasks, k=5, num_metatasks=10)
+count_map = np.zeros((4, 4,))
+maml.outer_loop(num_epochs=5000, count_map=count_map)
+maml.saveMAML()
 
 # adaption
 
-net = PolicyNet()
-tasks = FrozenLakeDistribution()
-maml = CusMAML(net, alpha=0.01, beta=0.001,
-               tasks=tasks, k=5, num_metatasks=10)
-maml.adaptToEveryTask()
+# net = PolicyNet()
+# tasks = FrozenLakeDistribution()
+# maml = CusMAML(net, alpha=0.01, beta=0.001,
+#                tasks=tasks, k=5, num_metatasks=10)
+# maml.adaptToEveryTask()

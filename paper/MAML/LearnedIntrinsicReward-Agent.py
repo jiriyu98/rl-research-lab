@@ -17,6 +17,7 @@ device = torch.device("cpu")
 
 # ref: https://github.com/GauravIyer/MAML-Pytorch/blob/master/Experiment%201/Experiment_1_Sine_Regression.ipynb
 # ref: https://coax.readthedocs.io/en/latest/examples/frozen_lake/ppo.html
+# ref-meta-update: https://discuss.pytorch.org/t/how-to-manually-update-network-parameters-while-keeping-track-of-its-computational-graph/131642
 
 # map
 
@@ -244,7 +245,7 @@ class Agent():
         self.h0 = None
         self.c0 = None
         self.opt = torch.optim.Adam(
-            self.intrinsic_reward_and_lifetime_value.parameters(), 0.01)
+            self.intrinsic_reward_and_lifetime_value.parameters(), 0.001)
         self.alpha = 0.01
 
         self.print_every = 200
@@ -325,13 +326,47 @@ class Agent():
                 rollout, values, logits, discounted_returns)
 
             # update policy
+            # ref: https://github.com/learnables/learn2learn/blob/06893e847693a0227d5f35a6e065e6161bb08201/learn2learn/utils/__init__.py
             policy_parameter_grads = torch.autograd.grad(
                 policy_loss, policy.parameters(), create_graph=True)
-            weights = {k: w - self.alpha * g for (k, w), g in zip(
-                policy.named_parameters(), policy_parameter_grads)}
-            policy.load_state_dict(weights)
+            updates = [w - self.alpha * g for w,
+                       g in zip(policy.parameters(), policy_parameter_grads)]
+
+            self.update_gradient(policy, updates)
 
         return rollouts
+
+    def update_gradient(self, module, updates=None):
+        if updates is not None:
+            params = list(module.parameters())
+            for p, g in zip(params, updates):
+                p.update = g
+
+        for param_key in module._parameters:
+            p = module._parameters[param_key]
+            if p is not None and hasattr(p, 'update') and p.update is not None:
+                module._parameters[param_key] = p.update
+
+        for module_key in module._modules:
+            module._modules[module_key] = self.update_gradient(
+                module._modules[module_key],
+                updates=None,
+            )
+
+        return module
+
+    def fix_parameters(self, module):
+        for param_key in module._parameters:
+            p = module._parameters[param_key].clone().detach()
+            p.requires_grad = True
+            module._parameters[param_key] = p
+
+        for module_key in module._modules:
+            module._modules[module_key] = self.fix_parameters(
+                module._modules[module_key],
+            )
+
+        return module
 
     def outer_loop(self, policy, task):
         # outer loop
@@ -390,6 +425,9 @@ class Agent():
             self.opt.zero_grad()
             loss.backward()
             self.opt.step()
+
+            # fianlly erase all the gradient info in the policy to avoid backwarding twice
+            self.fix_parameters(policy)
 
             # log
             for transition in rollout:

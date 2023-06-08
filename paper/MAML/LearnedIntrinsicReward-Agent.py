@@ -74,8 +74,6 @@ def generate_random_map(size=8, p=0.8):
 class FrozenLakeSingleTask():
     def __init__(self, desc) -> None:
         self.env = gym.make('FrozenLake-v1', desc=desc, is_slippery=False)
-        self.inner_lifetime_mask = 1.0
-        self.outer_lifetime_mask = 1.0
         # inner discount factor (intrinsic reward)
         self.inner_task_discount = 0.9
         # outer discount factor (extrinsic reward)
@@ -94,7 +92,7 @@ class FrozenLakeSingleTask():
         episode = []
         observation = self.env.reset()
         for _ in range(size):
-            action_prob = policy(observation)
+            action_prob, _ = policy(observation)
             action, _ = self.selectAction(action_prob)
             next_observation, extrinsic_reward, terminated, _ = self.env.step(
                 action)
@@ -107,12 +105,8 @@ class FrozenLakeSingleTask():
                             "extrinsic_reward": extrinsic_reward,
                             "next_observation": next_observation,
                             "terminated": terminated,
-                            "inner_lifetime_mask": self.inner_lifetime_mask,
-                            "outer_lifetime_mask": self.outer_lifetime_mask,
                             })
 
-            self.inner_lifetime_mask *= self.inner_task_discount
-            self.outer_lifetime_mask *= self.outer_task_discount
             observation = next_observation
 
             if terminated:
@@ -160,8 +154,14 @@ class PolicyNet(nn.Module):
             ('relu1', nn.ReLU()),
             ('l2', nn.Linear(64, 128)),
             ('relu2', nn.ReLU()),
-            ('l3', nn.Linear(128, 4)),
+        ]))
+
+        self.action_head = nn.Sequential(OrderedDict([
+            ('action_l1', nn.Linear(128, 4)),
             ('softMax1', nn.Softmax(dim=-1)),
+        ]))
+        self.value_head = nn.Sequential(OrderedDict([
+            ('value_l1', nn.Linear(128, 1)),
         ]))
 
     def forward(self, x):
@@ -169,8 +169,9 @@ class PolicyNet(nn.Module):
         x = x.to(device)
         x = F.one_hot(x, 16)
         x = x.to(torch.float)
+        x = self.net(x)
 
-        return self.net(x)
+        return self.action_head(x), self.value_head(x)
 
 
 class IntrinsicRewardAndLifetimeValue(nn.Module):
@@ -238,6 +239,8 @@ class Agent():
         self.trajectory_length = 8  # trajectory length (T)
         self.rollouts_number = 5  # outer unroll length (N)
 
+        self.lifetime_mask_count = 0
+
         self.lifetime_train_batch = 40
 
         # IntrinsicRewardAndLifetimeValue
@@ -246,7 +249,7 @@ class Agent():
         self.c0 = None
         self.opt = torch.optim.Adam(
             self.intrinsic_reward_and_lifetime_value.parameters(), 0.001)
-        self.alpha = 0.01
+        self.alpha = 0.1
 
         self.print_every = 200
         self.total_episode_count = 0
@@ -299,36 +302,55 @@ class Agent():
                     (obs, action, exr, term), (self.h0, self.c0))
                 intrinsic_rewards.append(intrinsic_reward)
 
-            # logits
+            # logits and state_values
             logits = []
+            values = []
             for j in range(rollout_length):
                 trans = rollout[j]
                 obs = trans["observation"]
-                logits.append(policy(obs))
+                logit, state_value = policy(obs)
+                logits.append(logit)
+                values.append(state_value)
+
+            last_trans = rollout[-1]
+            if last_trans["terminated"]:
+                values.append(0)
+            else:
+                _, state_value = policy(last_trans["next_observation"])
+                values.append(state_value)
+
+            assert (len(values) == rollout_length + 1)
 
             # discounted_returns
             discounted_returns = []
             discounted_acc = 0
+            bootstrap = values[-1]
             for j in range(rollout_length-1, -1, -1):
                 trans = rollout[j]
                 obs = trans["observation"]
                 intrinsic_reward = intrinsic_rewards[j]
                 discounted_acc = discounted_acc * task.inner_task_discount + intrinsic_reward
-                discounted_returns.append(discounted_acc)
+                bootstrap = bootstrap * task.inner_task_discount
+                discounted_returns.append(discounted_acc + bootstrap)
             discounted_returns = discounted_returns[::-1]
-
-            # values
-            values = []
-            for j in range(rollout_length):
-                values.append(0)
 
             policy_loss = self.policy_gradient_loss_fn(
                 rollout, values, logits, discounted_returns)
 
+            baseline_loss = 0
+            for j in range(rollout_length):
+                baseline_loss += 0.5 * \
+                    torch.square(discounted_returns[j] - values[j])
+
+            loss = policy_loss + baseline_loss
+
             # update policy
             # ref: https://github.com/learnables/learn2learn/blob/06893e847693a0227d5f35a6e065e6161bb08201/learn2learn/utils/__init__.py
             policy_parameter_grads = torch.autograd.grad(
-                policy_loss, policy.parameters(), create_graph=True)
+                loss, policy.parameters(), create_graph=True)
+            for grad in policy_parameter_grads:
+                torch.clamp(grad, -0.1, 0.1)
+
             updates = [w - self.alpha * g for w,
                        g in zip(policy.parameters(), policy_parameter_grads)]
 
@@ -368,20 +390,20 @@ class Agent():
 
         return module
 
-    def outer_loop(self, policy, task):
+    def outer_loop(self, policy, task: FrozenLakeSingleTask):
         # outer loop
         self.lifetime_episode_left = self.lifetime_episode_limit
         while self.lifetime_episode_left > 0:
             rollouts = self.inner_loop(task, policy)
 
-            # update intrinsic reward and lifetime value
+            # flatten: update intrinsic reward and lifetime value
             rollout = []
             for rl in rollouts:
                 rollout += rl
             rollout_length = len(rollout)
 
-            # rnn
-            lifetime_values = []
+            # rnn -> values
+            values = []
             for j in range(rollout_length):
                 trans = rollout[j]
                 obs, action, exr, term = trans["observation"], trans[
@@ -389,28 +411,33 @@ class Agent():
 
                 _, lifetime_value, _ = self.intrinsic_reward_and_lifetime_value(
                     (obs, action, exr, term), (self.h0, self.c0))
-                lifetime_values.append(lifetime_value)
+                values.append(lifetime_value)
 
             # logits
             logits = []
             for j in range(rollout_length):
                 trans = rollout[j]
                 obs = trans["observation"]
-                logits.append(policy(obs))
+                logit, _ = policy(obs)
+                logits.append(logit)
 
             # discounted_returns
             discounted_returns = []
             discounted_acc = 0
+            lifetime_mask = task.outer_task_discount ** self.lifetime_mask_count
+            bootstrap = values[-1]
             for j in range(rollout_length-1, -1, -1):
                 trans = rollout[j]
                 obs = trans["observation"]
                 extrinsic_reward = trans["extrinsic_reward"]
                 discounted_acc = discounted_acc * task.outer_task_discount + extrinsic_reward
-                discounted_returns.append(discounted_acc)
+                bootstrap = bootstrap * task.outer_task_discount
+                discounted_returns.append(
+                    (discounted_acc + bootstrap) * lifetime_mask)
             discounted_returns = discounted_returns[::-1]
 
-            # values
-            values = lifetime_values
+            # maintain the mask count
+            self.lifetime_mask_count += rollout_length
 
             policy_loss = self.policy_gradient_loss_fn(
                 rollout, values, logits, discounted_returns)
@@ -418,7 +445,7 @@ class Agent():
             baseline_loss = 0
             for j in range(rollout_length):
                 baseline_loss += 0.5 * \
-                    torch.square(discounted_returns[j] - lifetime_values[j])
+                    torch.square(discounted_returns[j] - values[j])
 
             # gradient update
             loss = policy_loss + baseline_loss
@@ -468,22 +495,22 @@ class Agent():
             policy = PolicyNet()
             # init a task
             task = FrozenLakeSingleTask(desc)
-            self.get_average_return(policy, task, "before training")
+            self.get_average_return(policy, task, "before training", 30)
             self.outer_loop(policy, task)
-            self.get_average_return(policy, task, "after training")
+            self.get_average_return(policy, task, "after training", 30)
             print()
 
-    def get_average_return(self, policy: PolicyNet, task: FrozenLakeSingleTask, output_str):
-        average_return = 0
+    def get_average_return(self, policy: PolicyNet, task: FrozenLakeSingleTask, output_str, total_count=None):
+        if total_count is None:
+            total_count = self.lifetime_episode_limit
 
-        total_count = self.lifetime_episode_limit
-
+        acc_return = 0
         for _ in range(total_count):
             episode = task.generateEpisode(policy)
             discounted_return = sum(x["extrinsic_reward"] for x in episode)
-            average_return += discounted_return
+            acc_return += discounted_return
         print("{} - discounted_return: {:.3f}".format(output_str,
-                                                      average_return / total_count))
+                                                      acc_return / total_count))
 
     def train(self):
         self.total_episode_count = 0
@@ -502,6 +529,8 @@ class Agent():
         if cbar_kw is None:
             cbar_kw = {}
 
+        # task
+
         desc = task.env.desc.copy().tolist()
         desc_dict = {b'S': 0, b'F': 1, b'H': 2, b'G': 3}
         m, n = len(desc), len(desc[0])
@@ -511,9 +540,31 @@ class Agent():
         desc = np.array(desc)
         cmap = colors.ListedColormap(['green', 'white', 'black', 'blue'])
         ax_task = plt.subplot(121)
-        ax_task.get_xaxis().set_visible(False)
-        ax_task.get_yaxis().set_visible(False)
-        ax_task.imshow(desc, cmap=cmap)
+        # ax_task.get_xaxis().set_visible(False)
+        # ax_task.get_yaxis().set_visible(False)
+        im = ax_task.imshow(desc, cmap="PuBuGn")
+
+        # Show all ticks and label them with the respective list entries.
+        ax_task.set_xticks(np.arange(data.shape[1]), labels=col_labels)
+        ax_task.set_yticks(np.arange(data.shape[0]), labels=row_labels)
+
+        # Let the horizontal axes labeling appear on top.
+        ax_task.tick_params(top=True, bottom=False,
+                            labeltop=True, labelbottom=False)
+
+        # Rotate the tick labels and set their alignment.
+        plt.setp(ax_task.get_xticklabels(), rotation=-30, ha="right",
+                 rotation_mode="anchor")
+
+        # Turn spines off and create white grid.
+        ax_task.spines[:].set_visible(False)
+
+        ax_task.set_xticks(np.arange(data.shape[1]+1)-.5, minor=True)
+        ax_task.set_yticks(np.arange(data.shape[0]+1)-.5, minor=True)
+        ax_task.grid(which="minor", color="w", linestyle='-', linewidth=3)
+        ax_task.tick_params(which="minor", bottom=False, left=False)
+
+        # heatmap
 
         # Plot the heatmap
         im = ax.imshow(data, **kwargs)
@@ -542,6 +593,7 @@ class Agent():
         ax.grid(which="minor", color="w", linestyle='-', linewidth=3)
         ax.tick_params(which="minor", bottom=False, left=False)
 
+        # save as png
         plt.savefig("./heatmap/" + name)
         plt.clf()
 

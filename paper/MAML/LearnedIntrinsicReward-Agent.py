@@ -177,55 +177,35 @@ class PolicyNet(nn.Module):
 class IntrinsicRewardAndLifetimeValue(nn.Module):
     def __init__(self):
         super().__init__()
-        self.rnn_hidden_size = 64
+        self.rnn_hidden_size = 2
         self.observation_dim = 16
         self.action_dim = 4
 
         self.net = nn.Sequential(OrderedDict([
-            ('lstm', nn.LSTM(self.observation_dim +
-             self.action_dim + 1 + 1, self.rnn_hidden_size)),
+            ('l1', nn.Linear(16, 128)),
             ('relu1', nn.ReLU()),
-            ('l2', nn.Linear(self.rnn_hidden_size, 128)),
-            ('relu2', nn.ReLU()),
-            ('l3', nn.Linear(128, 2)),
+            # ('l2', nn.Linear(64, 128)),
+            # ('relu2', nn.ReLU()),
+            ('lstm', nn.LSTM(128, self.rnn_hidden_size)),
         ]))
 
-    def forward(self, input, hidden_state=(None, None)):
+    def forward(self, s0, hidden_state=(None, None)):
         # input adjust
-        s0, a0, r1, d1 = input
-
         s0 = torch.tensor(s0).unsqueeze(0).detach()
         s0 = F.one_hot(s0, self.observation_dim)
         s0 = s0.to(torch.float)
 
-        a0 = torch.tensor(a0).unsqueeze(0).detach()
-        a0 = F.one_hot(a0, self.action_dim)
-        a0 = a0.to(torch.float)
-
-        r1 = torch.tensor([r1]).unsqueeze(0).detach()
-        d1 = torch.tensor([d1]).unsqueeze(0).detach()
-
-        # cat all the input
-        x = torch.cat((s0, a0, r1, d1), 1)
-
-        if hidden_state == (None, None):
-            h0, c0 = self.initHidden()
-        else:
-            h0, c0 = hidden_state
-
-        h0 = h0.detach()
-        c0 = c0.detach()
+        x = s0
 
         # split
-        lstm, fc = self.net[0], self.net[1:]
-        x, (hn, cn) = lstm(x, (h0, c0))
-        intrinsic_reward, lifetime_value = fc(x).squeeze(0)
+        fc, lstm = self.net[:-1], self.net[-1]
+
+        x = fc(x)
+        x, (hn, cn) = lstm(x, hidden_state)
+        intrinsic_reward, lifetime_value = x.squeeze(0)
 
         # intrinsicreward and history info
-        return intrinsic_reward, lifetime_value, (hn, cn)
-
-    def initHidden(self):
-        return torch.zeros((1, self.rnn_hidden_size)), torch.zeros((1, self.rnn_hidden_size))
+        return intrinsic_reward, lifetime_value, (hn.detach(), cn.detach())
 
 # agent
 
@@ -245,11 +225,11 @@ class Agent():
 
         # IntrinsicRewardAndLifetimeValue
         self.intrinsic_reward_and_lifetime_value = IntrinsicRewardAndLifetimeValue()
-        self.h0 = None
-        self.c0 = None
+        self.hidden_state = None
+        self.alpha = 0.01
+        self.beta = 0.001
         self.opt = torch.optim.Adam(
-            self.intrinsic_reward_and_lifetime_value.parameters(), 0.001)
-        self.alpha = 0.1
+            self.intrinsic_reward_and_lifetime_value.parameters(), lr=self.beta, eps=1e-3)
 
         self.print_every = 200
         self.total_episode_count = 0
@@ -280,11 +260,16 @@ class Agent():
 
         return policy_loss
 
-    def inner_loop(self, task: FrozenLakeSingleTask, policy: PolicyNet):
+    def get_rollouts(self, task: FrozenLakeSingleTask, policy: PolicyNet):
         rollouts, episode_count = task.getRollouts(
             self.episode_length_limit, self.trajectory_length, self.rollouts_number, policy, self.lifetime_episode_left)
         self.lifetime_episode_left -= episode_count
         self.total_episode_count += episode_count
+
+        return rollouts
+
+    def inner_loop(self, task: FrozenLakeSingleTask, policy: PolicyNet):
+        rollouts = self.get_rollouts(task, policy)
 
         # rollouts can be in many shapes so there is no check/assert
 
@@ -295,11 +280,10 @@ class Agent():
             intrinsic_rewards = []
             for j in range(rollout_length):
                 trans = rollout[j]
-                obs, action, exr, term = trans["observation"], trans[
-                    "action"], trans["extrinsic_reward"], trans["terminated"]
+                obs = trans["observation"]
 
-                intrinsic_reward, _, (self.h0, self.c0) = self.intrinsic_reward_and_lifetime_value(
-                    (obs, action, exr, term), (self.h0, self.c0))
+                intrinsic_reward, _, self.hidden_state = self.intrinsic_reward_and_lifetime_value(
+                    obs, self.hidden_state)
                 intrinsic_rewards.append(intrinsic_reward)
 
             # logits and state_values
@@ -312,12 +296,14 @@ class Agent():
                 logits.append(logit)
                 values.append(state_value)
 
-            last_trans = rollout[-1]
-            if last_trans["terminated"]:
-                values.append(0)
-            else:
-                _, state_value = policy(last_trans["next_observation"])
-                values.append(state_value)
+                if j == rollout_length - 1:
+                    last_trans = rollout[-1]
+
+                    if last_trans["terminated"]:
+                        values.append(0)
+                    else:
+                        _, state_value = policy(last_trans["next_observation"])
+                        values.append(state_value)
 
             assert (len(values) == rollout_length + 1)
 
@@ -392,7 +378,7 @@ class Agent():
 
     def outer_loop(self, policy, task: FrozenLakeSingleTask):
         # outer loop
-        self.lifetime_episode_left = self.lifetime_episode_limit
+        self.reset()
         while self.lifetime_episode_left > 0:
             rollouts = self.inner_loop(task, policy)
 
@@ -406,12 +392,15 @@ class Agent():
             values = []
             for j in range(rollout_length):
                 trans = rollout[j]
-                obs, action, exr, term = trans["observation"], trans[
-                    "action"], trans["extrinsic_reward"], trans["terminated"]
+                obs = trans["observation"]
 
                 _, lifetime_value, _ = self.intrinsic_reward_and_lifetime_value(
-                    (obs, action, exr, term), (self.h0, self.c0))
+                    obs, self.hidden_state)
                 values.append(lifetime_value)
+
+            # the last trans is only for bootstrapping
+            rollout_length -= 1
+            rollout.pop()
 
             # logits
             logits = []
@@ -432,8 +421,7 @@ class Agent():
                 extrinsic_reward = trans["extrinsic_reward"]
                 discounted_acc = discounted_acc * task.outer_task_discount + extrinsic_reward
                 bootstrap = bootstrap * task.outer_task_discount
-                discounted_returns.append(
-                    (discounted_acc + bootstrap) * lifetime_mask)
+                discounted_returns.append(discounted_acc + bootstrap)
             discounted_returns = discounted_returns[::-1]
 
             # maintain the mask count
@@ -449,6 +437,7 @@ class Agent():
 
             # gradient update
             loss = policy_loss + baseline_loss
+
             self.opt.zero_grad()
             loss.backward()
             self.opt.step()
@@ -473,7 +462,7 @@ class Agent():
 
     def reset(self):
         self.lifetime_episode_left = self.lifetime_episode_limit
-        self.total_episode_count = 0
+        self.hidden_state = None
 
     def test(self):
         descs = [
@@ -509,8 +498,8 @@ class Agent():
             episode = task.generateEpisode(policy)
             discounted_return = sum(x["extrinsic_reward"] for x in episode)
             acc_return += discounted_return
-        print("{} - discounted_return: {:.3f}".format(output_str,
-                                                      acc_return / total_count))
+        print("{} - average discounted return: {:.3f}".format(output_str,
+                                                              acc_return / total_count))
 
     def train(self):
         self.total_episode_count = 0

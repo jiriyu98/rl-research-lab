@@ -237,7 +237,7 @@ class Agent():
         self.intrinsic_reward_and_lifetime_value = IntrinsicRewardAndLifetimeValue()
         self.save_path = "./param/intrinsic_reward.ptc"
         self.hidden_state = (None, None)
-        self.alpha = 0.1
+        self.alpha = 0.01
         self.beta = 0.001
         self.opt = torch.optim.Adam(
             self.intrinsic_reward_and_lifetime_value.parameters(), lr=self.beta, eps=1e-3)
@@ -268,7 +268,7 @@ class Agent():
         # get discounted loss and adv
         advs = []
         for i in range(trajectory_length):
-            advs.append(discounted_returns[i] - values[i])
+            advs.append((discounted_returns[i] - values[i]).detach())
 
         policy_loss = 0
         for i in range(trajectory_length):
@@ -344,8 +344,8 @@ class Agent():
 
             baseline_loss = 0
             for j in range(rollout_length):
-                baseline_loss += 0.5 * \
-                    torch.square(discounted_returns[j] - values[j])
+                baseline_loss += F.smooth_l1_loss(
+                    discounted_returns[j], values[j])
 
             loss = policy_loss + baseline_loss
 
@@ -374,6 +374,11 @@ class Agent():
             if p is not None and hasattr(p, 'update') and p.update is not None:
                 module._parameters[param_key] = p.update
 
+        for buffer_key in module._buffers:
+            buff = module._buffers[buffer_key]
+            if buff is not None and hasattr(buff, 'update') and buff.update is not None:
+                module._buffers[buffer_key] = buff.update
+
         for module_key in module._modules:
             module._modules[module_key] = self.update_gradient(
                 module._modules[module_key],
@@ -387,6 +392,12 @@ class Agent():
             p = module._parameters[param_key].clone(
             ).detach().requires_grad_(True)
             module._parameters[param_key] = p
+
+        for buffer_key in module._buffers:
+            buff = module._buffers[buffer_key]
+            p = buff._parameters[buffer_key].clone(
+            ).detach().requires_grad_(True)
+            module._buffers[buffer_key] = p
 
         for module_key in module._modules:
             module._modules[module_key] = self.fix_parameters(
@@ -451,8 +462,8 @@ class Agent():
 
             baseline_loss = 0
             for j in range(rollout_length):
-                baseline_loss += 0.5 * \
-                    torch.square(discounted_returns[j] - values[j])
+                baseline_loss += F.smooth_l1_loss(
+                    discounted_returns[j], values[j])
 
             # gradient update
             loss = policy_loss + baseline_loss
@@ -480,8 +491,10 @@ class Agent():
                 #     policy, self.intrinsic_reward_and_lifetime_value)
 
             self.count_map = np.zeros((4, 4,))
-            print("{}/{}. loss: {:.3f}".format(self.total_episode_count,
-                                               self.lifetime_episode_limit * self.lifetime_train_batch, loss.item()))
+            print("log: {}/{}. loss: {:.3f}, average return: {:.3f}".format(self.total_episode_count,
+                                                                            self.lifetime_episode_limit * self.lifetime_train_batch,
+                                                                            loss.item(),
+                                                                            self.get_average_return(policy, task)))
 
     def reset(self):
         self.lifetime_episode_left = self.lifetime_episode_limit
@@ -531,7 +544,7 @@ class Agent():
             self.get_average_return(policy, task, "after training", 30)
             print()
 
-    def get_average_return(self, policy: PolicyNet, task: FrozenLakeSingleTask, output_str, total_count=None):
+    def get_average_return(self, policy: PolicyNet, task: FrozenLakeSingleTask, total_count=None):
         if total_count is None:
             total_count = self.lifetime_episode_limit
 
@@ -540,8 +553,7 @@ class Agent():
             episode = task.generateEpisode(policy)
             discounted_return = sum(x["extrinsic_reward"] for x in episode)
             acc_return += discounted_return
-        print("{} - average discounted return: {:.3f}".format(output_str,
-                                                              acc_return / total_count))
+        return acc_return / total_count
 
     def train(self):
         self.total_episode_count = 0

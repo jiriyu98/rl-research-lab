@@ -5,7 +5,10 @@ from rlax._src.multistep import discounted_returns
 from rlax._src.policy_gradients import policy_gradient_loss, entropy_loss
 import gymnasium as gym
 import optax
+import chex
 import coax
+from unittest import TestCase
+import pickle
 from functools import partial
 
 # ref: https://github.com/hamishs/JAX-RL/blob/main/src/jax_rl/algorithms/ppo.py
@@ -228,6 +231,11 @@ class Agent():
                     self.train()
                     self.buffer.reset()  # then reset the buffer
 
+                    self.save(self.policy_learner_state,
+                              './tmp/params/policy.dp')
+                    self.save(self.irs_learner_state,
+                              './tmp/params/irs.dp')
+
                 if done or truncated:
                     break
 
@@ -241,6 +249,14 @@ class Agent():
         opt_init, opt_update = optax.adam(lr)
         opt_state = opt_init(params)
         return opt_update, opt_state
+
+    def save(self, state, path):
+        with open(path, 'wb') as fp:
+            pickle.dump(state, fp)
+
+    def load(self, path) -> hk.Params:
+        with open(path, 'rb') as fp:
+            return pickle.load(fp)
 
 
 class ReplayBuffer(object):

@@ -6,9 +6,11 @@ from rlax._src.policy_gradients import policy_gradient_loss, entropy_loss
 import gymnasium as gym
 import optax
 import chex
+import numpy as np
 import coax
 from unittest import TestCase
 import pickle
+import matplotlib.pyplot as plt
 from functools import partial
 
 # ref: https://github.com/hamishs/JAX-RL/blob/main/src/jax_rl/algorithms/ppo.py
@@ -36,7 +38,7 @@ class Agent():
 
         def irs_forward(S):
             values1 = hk.Sequential(
-                (hk.Linear(1, w_init=jnp.zeros), jnp.ravel, jnp.tanh))
+                (hk.Linear(1, w_init=None), jnp.ravel, jnp.tanh))
             values2 = hk.Sequential(
                 (hk.Linear(1, w_init=jnp.zeros), jnp.ravel))
             return values1(S), values2(S)
@@ -72,6 +74,20 @@ class Agent():
 
     # Note that this method should be pure function
     def inner_update(self, eta, learner_state, rollout):
+        def inner_loss(theta, rollout, returns, advantages):
+            logits, v = self._apply_param_on_obs(
+                self.policy, theta, rollout["s"])
+            masks = jnp.ones_like(advantages)
+            pg_loss = policy_gradient_loss(logits_t=logits,
+                                           a_t=rollout["a"],
+                                           adv_t=advantages,
+                                           w_t=masks,
+                                           use_stop_gradient=True,)
+            baseline_loss = 0.5 * jnp.sum(jnp.square(v - returns) * masks)
+            entro_loss = entropy_loss(logits_t=logits, w_t=masks)
+
+            return pg_loss + baseline_loss + 0.01 * entro_loss
+
         policy_params = learner_state["params"]
         policy_opt_state = learner_state["opt_state"]
 
@@ -84,25 +100,11 @@ class Agent():
             v_t=rollout["v"][-1],
         )
         advantages = returns - rollout["v"]
-        masks = jnp.ones_like(advantages)
 
-        def inner_loss(theta, rollout, returns, advantages):
-            logits, v = self._apply_param_on_obs(
-                self.policy, theta, rollout["s"])
-            pg_loss = policy_gradient_loss(logits_t=logits,
-                                           a_t=rollout["a"],
-                                           adv_t=advantages,
-                                           w_t=masks,
-                                           use_stop_gradient=True,)
-            baseline_loss = 0.5 * jnp.sum(jnp.square(v - returns) * masks)
-            entro_loss = entropy_loss(logits_t=logits, w_t=masks)
-
-            return pg_loss + baseline_loss + 0.01 * entro_loss
-
-        dl_dtheta = jax.grad(inner_loss)(
+        dldtheta = jax.grad(inner_loss)(
             policy_params, rollout, returns, advantages)
         p_updates, policy_opt_state = self.policy_update(
-            dl_dtheta, policy_opt_state, policy_params)
+            dldtheta, policy_opt_state, policy_params)
         policy_params = optax.apply_updates(policy_params, p_updates)
 
         return {"params": policy_params,
@@ -120,15 +122,15 @@ class Agent():
             all_v_lifetime = []
             all_discounts = []
 
-            theta = learner_state["params"]
-
             for rollout in rollouts:
+                theta = learner_state["params"]
+
                 all_ex_r.append(rollout["ex_r"])
                 all_action.append(rollout["a"])
                 all_discounts.append(rollout["discounted_t"])
                 logits, _ = self._apply_param_on_obs(
                     self.policy, theta, rollout["s"])
-                irs, lifetime_value = self._apply_param_on_obs(
+                _, lifetime_value = self._apply_param_on_obs(
                     self.irs, eta, rollout["s"])
                 all_logits.append(logits)
                 all_v_lifetime.append(lifetime_value.squeeze())  # squeeze
@@ -212,6 +214,7 @@ class Agent():
         self.policy_learner_state = policy_learner_state
 
     def learn(self):
+        intrinsic_update_count = 0
         for ep in range(50_000):
             s, _ = self.env.reset()
 
@@ -228,13 +231,21 @@ class Agent():
                 self.buffer.push(s, a, ex_r, v[0], s_next, done)
 
                 if len(self.buffer) == self.buffer_size:
+                    # update counter
+                    intrinsic_update_count += 1
+                    # train
                     self.train()
-                    self.buffer.reset()  # then reset the buffer
 
-                    self.save(self.policy_learner_state,
-                              './tmp/params/policy.dp')
-                    self.save(self.irs_learner_state,
-                              './tmp/params/irs.dp')
+                    if intrinsic_update_count % 100 == 0:
+                        # save params and heatmap
+                        self.save(self.policy_learner_state,
+                                  './tmp/params/policy.dp')
+                        self.save(self.irs_learner_state,
+                                  './tmp/params/irs.dp')
+                        self.save_heatmap(
+                            name="heatmap_after_{}_updates".format(intrinsic_update_count))
+
+                    self.buffer.reset()  # then reset the buffer
 
                 if done or truncated:
                     break
@@ -257,6 +268,84 @@ class Agent():
     def load(self, path) -> hk.Params:
         with open(path, 'rb') as fp:
             return pickle.load(fp)
+
+    def save_heatmap(self, name="temp", **kwargs):
+        plt.figure(figsize=[12, 12])
+        plt.subplots_adjust(wspace=0.3, hspace=0.3)
+
+        # 1. task
+
+        desc = self.env.env.desc.copy().tolist()
+        desc_dict = {b'S': 0, b'F': 1, b'H': 2, b'G': 3}
+        m, n = len(desc), len(desc[0])
+        for i in range(m):
+            for j in range(n):
+                desc[i][j] = desc_dict[desc[i][j]]
+        desc = np.array(desc)
+        ax = plt.subplot(231)
+        self.generate_heatmap("task env", desc, ax)
+
+        # 2&3. irs and lifetime_ex_r
+        desc = jnp.arange(16)
+        irs, lifetime_ex_r = self._apply_param_on_obs(
+            self.irs, self.irs_learner_state["params"], desc)
+        irs = irs.reshape(m, n)
+        lifetime_ex_r = lifetime_ex_r.reshape(m, n)
+        ax = plt.subplot(232)
+        self.generate_heatmap("irs heatmap", irs, ax)
+
+        ax = plt.subplot(233)
+        self.generate_heatmap("lifetime_ex_r", lifetime_ex_r, ax)
+
+        # 4. irs_value
+        _, v = self._apply_param_on_obs(
+            self.policy, self.policy_learner_state["params"], desc)
+        v = v.reshape(m, n)
+        ax = plt.subplot(234)
+        self.generate_heatmap("irs value", v, ax)
+
+        # 5. rollout exps
+        rollouts = self.buffer.get_rollouts()
+        desc = [0] * (m * n)
+        for rollout in rollouts:
+            for s in rollout["s"]:
+                desc[int(s)] += 1
+        desc = jnp.asarray(desc).reshape(m, n)
+        ax = plt.subplot(235)
+        self.generate_heatmap("train visit count", desc, ax)
+
+        # 6. rollout exps
+
+        # save as png
+        plt.savefig("./heatmap/" + name)
+        plt.clf()
+        plt.close()
+
+    def generate_heatmap(self, name, data, ax, col_labels=None, row_labels=None):
+        im = ax.imshow(data, cmap="PuBuGn")
+        # Create colorbar
+        cbar = ax.figure.colorbar(im, ax=ax)
+        cbar.ax.set_ylabel(None, rotation=-90, va="bottom")
+        ax.set_title(name)
+        # Show all ticks and label them with the respective list entries.
+        ax.set_xticks(np.arange(data.shape[1]), labels=col_labels)
+        ax.set_yticks(np.arange(data.shape[0]), labels=row_labels)
+
+        # Let the horizontal axes labeling appear on top.
+        ax.tick_params(top=True, bottom=False,
+                       labeltop=True, labelbottom=False)
+
+        # Rotate the tick labels and set their alignment.
+        plt.setp(ax.get_xticklabels(), rotation=-30, ha="right",
+                 rotation_mode="anchor")
+
+        # Turn spines off and create white grid.
+        ax.spines[:].set_visible(False)
+
+        ax.set_xticks(np.arange(data.shape[1]+1)-.5, minor=True)
+        ax.set_yticks(np.arange(data.shape[0]+1)-.5, minor=True)
+        ax.grid(which="minor", color="w", linestyle='-', linewidth=3)
+        ax.tick_params(which="minor", bottom=False, left=False)
 
 
 class ReplayBuffer(object):

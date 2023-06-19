@@ -5,13 +5,14 @@ from rlax._src.multistep import discounted_returns
 from rlax._src.policy_gradients import policy_gradient_loss, entropy_loss
 import gymnasium as gym
 import optax
-import chex
 import numpy as np
 import coax
-from unittest import TestCase
 import pickle
 import matplotlib.pyplot as plt
 from functools import partial
+from jax.config import config
+
+# config.update("jax_debug_nans", True)
 
 # ref: https://github.com/hamishs/JAX-RL/blob/main/src/jax_rl/algorithms/ppo.py
 
@@ -24,7 +25,7 @@ class Agent():
         # policy and irs
         def policy_forward(S):
             logits = hk.Sequential(
-                (hk.Linear(env.action_space.n, w_init=jnp.zeros), jax.nn.softmax))
+                (hk.Linear(env.action_space.n, w_init=jnp.zeros),))
             values = hk.Sequential((hk.Linear(1, w_init=jnp.zeros), jnp.ravel))
             return logits(S), values(S)
 
@@ -38,7 +39,7 @@ class Agent():
 
         def irs_forward(S):
             values1 = hk.Sequential(
-                (hk.Linear(1, w_init=None), jnp.ravel, jnp.tanh))
+                (hk.Linear(1, w_init=jnp.zeros), jnp.arctan, jnp.ravel))
             values2 = hk.Sequential(
                 (hk.Linear(1, w_init=jnp.zeros), jnp.ravel))
             return values1(S), values2(S)
@@ -82,7 +83,7 @@ class Agent():
                                            a_t=rollout["a"],
                                            adv_t=advantages,
                                            w_t=masks,
-                                           use_stop_gradient=True,)
+                                           use_stop_gradient=False,)  # important to keep gradient
             baseline_loss = 0.5 * jnp.sum(jnp.square(v - returns) * masks)
             entro_loss = entropy_loss(logits_t=logits, w_t=masks)
 
@@ -100,6 +101,29 @@ class Agent():
             v_t=rollout["v"][-1],
         )
         advantages = returns - rollout["v"]
+
+        # def test_inner_loss(eta, theta, rollout):
+        #     irs, _ = self._apply_param_on_obs(
+        #         self.irs, eta, rollout["s"])
+
+        #     returns = discounted_returns(
+        #         r_t=irs,
+        #         discount_t=rollout["discounted_t"] * self.ep_gamma,
+        #         v_t=rollout["v"][-1],
+        #     )
+        #     advantages = returns - rollout["v"]
+        #     logits, v = self._apply_param_on_obs(
+        #         self.policy, theta, rollout["s"])
+        #     masks = jnp.ones_like(advantages)
+        #     pg_loss = policy_gradient_loss(logits_t=logits,
+        #                                    a_t=rollout["a"],
+        #                                    adv_t=advantages,
+        #                                    w_t=masks,
+        #                                    use_stop_gradient=True,)
+        #     baseline_loss = 0.5 * jnp.sum(jnp.square(v - returns) * masks)
+        #     entro_loss = entropy_loss(logits_t=logits, w_t=masks)
+
+        #     return pg_loss + baseline_loss + 0.01 * entro_loss
 
         dldtheta = jax.grad(inner_loss)(
             policy_params, rollout, returns, advantages)
@@ -123,17 +147,18 @@ class Agent():
             all_discounts = []
 
             for rollout in rollouts:
-                theta = learner_state["params"]
+                # learner_state = self.inner_update(
+                #     eta, learner_state, rollout)
 
                 all_ex_r.append(rollout["ex_r"])
                 all_action.append(rollout["a"])
                 all_discounts.append(rollout["discounted_t"])
                 logits, _ = self._apply_param_on_obs(
-                    self.policy, theta, rollout["s"])
+                    self.policy, learner_state["params"], rollout["s"])
                 _, lifetime_value = self._apply_param_on_obs(
                     self.irs, eta, rollout["s"])
                 all_logits.append(logits)
-                all_v_lifetime.append(lifetime_value.squeeze())  # squeeze
+                all_v_lifetime.append(lifetime_value)
                 bootstrap_value_v_lifetime = lifetime_value[-1]
 
                 learner_state = self.inner_update(
@@ -158,7 +183,7 @@ class Agent():
                 a_t=all_action,
                 adv_t=advantages,
                 w_t=masks,
-                use_stop_gradient=False)
+                use_stop_gradient=True,)
             baseline_loss = 0.5 * \
                 jnp.sum(jnp.square(all_v_lifetime - returns) * masks)
             entro_loss = entropy_loss(
@@ -192,14 +217,14 @@ class Agent():
     def _sample_func(self, obs):
         logits, _ = self._apply_param_on_obs(
             self.policy, self.policy_learner_state["params"], obs)
-        logits = logits.squeeze()
+        logits = jax.nn.softmax(logits).squeeze()
         X = self._sample(logits)
 
         return X, logits[X]
 
     def train(self):
-        rollouts = self.buffer.get_rollouts()
         policy_learner_state = self.policy_learner_state
+        rollouts = self.buffer.get_rollouts()
 
         # update at the beginning because outer_update won't update policy_learner_state
         for rollout in rollouts:
@@ -208,7 +233,6 @@ class Agent():
                 eta, policy_learner_state, rollout)
 
         # then
-        rollouts = self.buffer.get_rollouts()
         self.irs_learner_state = self.outer_update(
             self.irs_learner_state, self.policy_learner_state, rollouts)
         self.policy_learner_state = policy_learner_state
@@ -236,7 +260,7 @@ class Agent():
                     # train
                     self.train()
 
-                    if intrinsic_update_count % 100 == 0:
+                    if intrinsic_update_count % 1 == 0:
                         # save params and heatmap
                         self.save(self.policy_learner_state,
                                   './tmp/params/policy.dp')
@@ -257,9 +281,10 @@ class Agent():
                 break
 
     def init_optimiser(self, lr, params):
-        opt_init, opt_update = optax.adam(lr)
-        opt_state = opt_init(params)
-        return opt_update, opt_state
+        optimizer = optax.chain(optax.clip_by_global_norm(1.0),
+                                optax.adam(lr, b1=0.9, b2=0.99),)
+        opt_state = optimizer.init(params)
+        return optimizer.update, opt_state
 
     def save(self, state, path):
         with open(path, 'wb') as fp:
@@ -366,10 +391,13 @@ class ReplayBuffer(object):
                 'discounted_t': jnp.ones_like(jnp.asarray(state))}
 
     def get_rollouts(self):
+        rollouts = []
         idx = 0
         while idx < self.capacity:
-            yield self.get_rollout(idx, self.batch_size)
+            rollouts.append(self.get_rollout(idx, self.batch_size))
             idx += self.batch_size
+
+        return rollouts
 
     def __len__(self):
         return len(self.buffer)
@@ -381,6 +409,6 @@ class ReplayBuffer(object):
 if __name__ == "__main__":
     env = gym.make('FrozenLake-v1', is_slippery=False)
     env = coax.wrappers.TrainMonitor(env)
-    agent = Agent(env, 0.01, 0.01)
+    agent = Agent(env, 0.01, 0.001)
 
     agent.learn()

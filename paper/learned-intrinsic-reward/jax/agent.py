@@ -46,10 +46,14 @@ class Agent():
             lr_policy, policy_params)
 
         def irs_forward(S):
-            values1 = hk.Sequential(
-                (hk.Linear(1, w_init=None), jnp.arctan, jnp.ravel))
-            values2 = hk.Sequential(
-                (hk.Linear(1, w_init=None), jnp.ravel))
+            values1 = hk.Sequential((
+                hk.Linear(64, w_init=None), jax.nn.relu,
+                hk.Linear(1, w_init=None),
+                jnp.arctan, jnp.ravel))
+            values2 = hk.Sequential((
+                hk.Linear(64, w_init=None), jax.nn.relu,
+                hk.Linear(1, w_init=None),
+                jnp.ravel))
             return values1(S), values2(S)
 
         irs = hk.without_apply_rng(hk.transform(irs_forward))
@@ -303,24 +307,29 @@ class Agent():
         self.generate_heatmap("irs heatmap", irs, ax)
 
         ax = plt.subplot(233)
-        self.generate_heatmap("lifetime_ex_r", lifetime_ex_r, ax)
+        self.generate_heatmap(
+            "estimated lifetime-ex reward", lifetime_ex_r, ax)
 
         # 4. irs_value
         _, v = self._apply_param_on_obs(
             self.policy, self.policy_learner_state.params, desc)
         v = v.reshape(m, n)
         ax = plt.subplot(234)
-        self.generate_heatmap("irs value", v, ax)
+        self.generate_heatmap("estimated irs value", v, ax)
 
         # 5. rollout exps
         rollouts = self.buffer.get_rollouts()
         desc = [0] * (m * n)
         for rollout in rollouts:
-            for s in rollout["s"]:
+            for i in range(len(rollout)):
+                s, ns, ex_r = rollout["s"][i], rollout["ns"][i], rollout["ex_r"][i]
                 desc[int(s)] += 1
+                if ex_r > 0:
+                    desc[int(ns)] += 1
+
         desc = jnp.asarray(desc).reshape(m, n)
         ax = plt.subplot(235)
-        self.generate_heatmap("train visit count", desc, ax)
+        self.generate_heatmap("the last rollouts visit count", desc, ax)
 
         # 6. rollout exps
 
@@ -392,6 +401,6 @@ class ReplayBuffer(object):
 if __name__ == "__main__":
     env = gym.make('FrozenLake-v1', is_slippery=False)
     env = coax.wrappers.TrainMonitor(env)
-    agent = Agent(env, 0.01, 0.001)
+    agent = Agent(env, 0.02, 0.01)
 
     agent.learn()

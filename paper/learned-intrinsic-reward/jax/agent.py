@@ -9,12 +9,20 @@ import numpy as np
 import coax
 import pickle
 import matplotlib.pyplot as plt
-from functools import partial
-from jax.config import config
+from jax.tree_util import register_pytree_node
+from collections import namedtuple
 
 # config.update("jax_debug_nans", True)
 
 # ref: https://github.com/hamishs/JAX-RL/blob/main/src/jax_rl/algorithms/ppo.py
+
+TrainState = namedtuple(
+    "TrainState", ["params", "opt_state"])
+register_pytree_node(
+    TrainState,
+    lambda xs: (tuple(xs), None),
+    lambda _, xs: TrainState(*xs)
+)
 
 
 class Agent():
@@ -25,8 +33,8 @@ class Agent():
         # policy and irs
         def policy_forward(S):
             logits = hk.Sequential(
-                (hk.Linear(env.action_space.n, w_init=jnp.zeros),))
-            values = hk.Sequential((hk.Linear(1, w_init=jnp.zeros), jnp.ravel))
+                (hk.Linear(env.action_space.n, w_init=None),))
+            values = hk.Sequential((hk.Linear(1, w_init=None), jnp.ravel))
             return logits(S), values(S)
 
         policy = hk.without_apply_rng(hk.transform(policy_forward))
@@ -39,9 +47,9 @@ class Agent():
 
         def irs_forward(S):
             values1 = hk.Sequential(
-                (hk.Linear(1, w_init=jnp.zeros), jnp.arctan, jnp.ravel))
+                (hk.Linear(1, w_init=None), jnp.arctan, jnp.ravel))
             values2 = hk.Sequential(
-                (hk.Linear(1, w_init=jnp.zeros), jnp.ravel))
+                (hk.Linear(1, w_init=None), jnp.ravel))
             return values1(S), values2(S)
 
         irs = hk.without_apply_rng(hk.transform(irs_forward))
@@ -52,13 +60,12 @@ class Agent():
         self.irs_update, irs_opt_state = self.init_optimiser(
             lr_irs, irs_params)
 
-        # construct state
-        self.policy_learner_state = {"params": policy_params,
-                                     "opt_state": policy_opt_state,
-                                     }
-        self.irs_learner_state = {"params": irs_params,
-                                  "opt_state": irs_opt_state,
-                                  }
+        # trainstate
+        self.policy_learner_state = TrainState(
+            policy_params, policy_opt_state)
+        self.irs_learner_state = TrainState(
+            irs_params, irs_opt_state
+        )
 
         # env
         self.env = env
@@ -74,7 +81,7 @@ class Agent():
         self.life_gamma = 0.99
 
     # Note that this method should be pure function
-    def inner_update(self, eta, learner_state, rollout):
+    def inner_update(self, eta, learner_state: TrainState, rollout):
         def inner_loss(theta, rollout, returns, advantages):
             logits, v = self._apply_param_on_obs(
                 self.policy, theta, rollout["s"])
@@ -89,8 +96,8 @@ class Agent():
 
             return pg_loss + baseline_loss + 0.01 * entro_loss
 
-        policy_params = learner_state["params"]
-        policy_opt_state = learner_state["opt_state"]
+        policy_params = learner_state.params
+        policy_opt_state = learner_state.opt_state
 
         irs, _ = self._apply_param_on_obs(
             self.irs, eta, rollout["s"])
@@ -102,42 +109,21 @@ class Agent():
         )
         advantages = returns - rollout["v"]
 
-        # def test_inner_loss(eta, theta, rollout):
-        #     irs, _ = self._apply_param_on_obs(
-        #         self.irs, eta, rollout["s"])
-
-        #     returns = discounted_returns(
-        #         r_t=irs,
-        #         discount_t=rollout["discounted_t"] * self.ep_gamma,
-        #         v_t=rollout["v"][-1],
-        #     )
-        #     advantages = returns - rollout["v"]
-        #     logits, v = self._apply_param_on_obs(
-        #         self.policy, theta, rollout["s"])
-        #     masks = jnp.ones_like(advantages)
-        #     pg_loss = policy_gradient_loss(logits_t=logits,
-        #                                    a_t=rollout["a"],
-        #                                    adv_t=advantages,
-        #                                    w_t=masks,
-        #                                    use_stop_gradient=True,)
-        #     baseline_loss = 0.5 * jnp.sum(jnp.square(v - returns) * masks)
-        #     entro_loss = entropy_loss(logits_t=logits, w_t=masks)
-
-        #     return pg_loss + baseline_loss + 0.01 * entro_loss
-
         dldtheta = jax.grad(inner_loss)(
             policy_params, rollout, returns, advantages)
-        p_updates, policy_opt_state = self.policy_update(
-            dldtheta, policy_opt_state, policy_params)
-        policy_params = optax.apply_updates(policy_params, p_updates)
+        # p_updates, policy_opt_state = self.policy_update(
+        #     dldtheta, policy_opt_state, policy_params)
+        # policy_params = optax.apply_updates(policy_params, p_updates)
 
-        return {"params": policy_params,
-                "opt_state": policy_opt_state, }
+        policy_params = jax.tree_map(
+            lambda g, state: state - 0.01 * g, dldtheta, policy_params)
 
-    def outer_update(self, irs_learner_state, policy_learner_state, rollouts):
+        return TrainState(policy_params, policy_opt_state)
+
+    def outer_update(self, irs_learner_state: TrainState, policy_learner_state: TrainState, rollouts):
         # namedtuple can be used to optimize
-        eta = irs_learner_state["params"]
-        irs_opt_state = irs_learner_state["opt_state"]
+        eta = irs_learner_state.params
+        irs_opt_state = irs_learner_state.opt_state
 
         def outer_loss(eta, learner_state, rollouts):
             all_ex_r = []
@@ -154,7 +140,7 @@ class Agent():
                 all_action.append(rollout["a"])
                 all_discounts.append(rollout["discounted_t"])
                 logits, _ = self._apply_param_on_obs(
-                    self.policy, learner_state["params"], rollout["s"])
+                    self.policy, learner_state.params, rollout["s"])
                 _, lifetime_value = self._apply_param_on_obs(
                     self.irs, eta, rollout["s"])
                 all_logits.append(logits)
@@ -196,10 +182,7 @@ class Agent():
             dmdeta, irs_opt_state, eta)
         irs_params = optax.apply_updates(eta, eta_updates)
 
-        return {
-            "params": irs_params,
-            "opt_state": irs_opt_state
-        }
+        return TrainState(irs_params, irs_opt_state)
 
     def _observation_preprocess(self, X):
         X = jnp.asarray(X)
@@ -216,7 +199,7 @@ class Agent():
 
     def _sample_func(self, obs):
         logits, _ = self._apply_param_on_obs(
-            self.policy, self.policy_learner_state["params"], obs)
+            self.policy, self.policy_learner_state.params, obs)
         logits = jax.nn.softmax(logits).squeeze()
         X = self._sample(logits)
 
@@ -228,7 +211,7 @@ class Agent():
 
         # update at the beginning because outer_update won't update policy_learner_state
         for rollout in rollouts:
-            eta = self.irs_learner_state["params"]
+            eta = self.irs_learner_state.params
             policy_learner_state = self.inner_update(
                 eta, policy_learner_state, rollout)
 
@@ -251,7 +234,7 @@ class Agent():
                     ex_r = -0.01
 
                 _, v = self._apply_param_on_obs(
-                    self.policy, self.policy_learner_state["params"], s)
+                    self.policy, self.policy_learner_state.params, s)
                 self.buffer.push(s, a, ex_r, v[0], s_next, done)
 
                 if len(self.buffer) == self.buffer_size:
@@ -260,7 +243,7 @@ class Agent():
                     # train
                     self.train()
 
-                    if intrinsic_update_count % 1 == 0:
+                    if intrinsic_update_count % 100 == 0:
                         # save params and heatmap
                         self.save(self.policy_learner_state,
                                   './tmp/params/policy.dp')
@@ -281,7 +264,7 @@ class Agent():
                 break
 
     def init_optimiser(self, lr, params):
-        optimizer = optax.chain(optax.clip_by_global_norm(1.0),
+        optimizer = optax.chain(optax.clip(1.0),
                                 optax.adam(lr, b1=0.9, b2=0.99),)
         opt_state = optimizer.init(params)
         return optimizer.update, opt_state
@@ -313,7 +296,7 @@ class Agent():
         # 2&3. irs and lifetime_ex_r
         desc = jnp.arange(16)
         irs, lifetime_ex_r = self._apply_param_on_obs(
-            self.irs, self.irs_learner_state["params"], desc)
+            self.irs, self.irs_learner_state.params, desc)
         irs = irs.reshape(m, n)
         lifetime_ex_r = lifetime_ex_r.reshape(m, n)
         ax = plt.subplot(232)
@@ -324,7 +307,7 @@ class Agent():
 
         # 4. irs_value
         _, v = self._apply_param_on_obs(
-            self.policy, self.policy_learner_state["params"], desc)
+            self.policy, self.policy_learner_state.params, desc)
         v = v.reshape(m, n)
         ax = plt.subplot(234)
         self.generate_heatmap("irs value", v, ax)

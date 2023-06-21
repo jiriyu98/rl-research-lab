@@ -76,7 +76,7 @@ class Agent():
 
         # buffer
         self.buffer = ReplayBuffer(
-            capacity=buffer_size, batch_size=buffer_batch_size)
+            capacity=buffer_size, batch_size=buffer_batch_size, truncated=True)
 
         # gamma
         self.ep_gamma = 0.9
@@ -245,7 +245,8 @@ class Agent():
                     self.policy, self.policy_learner_state.params, s)
                 _, nv = self._apply_param_on_obs(
                     self.policy, self.policy_learner_state.params, s_next)
-                self.buffer.push(s, a, ex_r, v[0], nv[0], s_next, done)
+                self.buffer.push(
+                    s, a, ex_r, v[0], 0. if done else nv[0], s_next, done)
 
                 if self.buffer.is_full():
                     # update counter

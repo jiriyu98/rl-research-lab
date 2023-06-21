@@ -11,10 +11,79 @@ import pickle
 import matplotlib.pyplot as plt
 from jax.tree_util import register_pytree_node
 from collections import namedtuple
+from functools import partial
+import argparse
+
 
 # config.update("jax_debug_nans", True)
 
 # ref: https://github.com/hamishs/JAX-RL/blob/main/src/jax_rl/algorithms/ppo.py
+
+# Create the parser
+parser = argparse.ArgumentParser(description='Learned Intrinsic Reward Agent')
+
+# Add arguments
+parser.add_argument(
+    '--heat_map_output', default='./heatmap/', help='Path to the the output heatmap directory')
+parser.add_argument(
+    '--episode_num_per_lifetime', default=200, help='')
+parser.add_argument(
+    '--multiple_lifetime_mode', default=False, help='')
+parser.add_argument(
+    '--save_heatmap_per_time', default=100, help='')
+
+# Parse the command-line arguments
+args = parser.parse_args()
+
+
+def generate_random_map(size=8, p=0.8):
+    """Generates a random valid map (one that has a path from start to goal)
+    :param size: size of each side of the grid
+    :param p: probability that a tile is frozen
+    """
+    valid = False
+
+    # DFS to check that it's a valid path.
+    def is_valid(res):
+        frontier, discovered = [], set()
+        frontier.append((0, 0))
+        while frontier:
+            r, c = frontier.pop()
+            if not (r, c) in discovered:
+                discovered.add((r, c))
+                directions = [(1, 0), (0, 1), (-1, 0), (0, -1)]
+                for x, y in directions:
+                    r_new = r + x
+                    c_new = c + y
+                    if r_new < 0 or r_new >= size or c_new < 0 or c_new >= size:
+                        continue
+                    if res[r_new][c_new] == "G":
+                        return True
+                    if res[r_new][c_new] != "H":
+                        frontier.append((r_new, c_new))
+        return False
+
+    def random_choice_unrepeatable(matrix, num):
+        rows, cols = size, size
+        avaliable_positions = [(row, col) for row in range(rows)
+                               for col in range(cols) if matrix[row][col] == 'F']
+        return [avaliable_positions[x] for x in np.random.choice(len(avaliable_positions), 2, replace=False)]
+
+    while not valid:
+        p = min(1, p)
+        # res = np.random.choice(["F", "H"], (size, size), p=[p, 1 - p])
+        # res = np.random.choice(["F", "H"], (size, size), p=[p, 1 - p])
+        res = ["FFFF", "FHFH", "FFFH", "HFFF"]
+        res = [list(x) for x in res]
+
+        (s_x, s_y), (g_x, g_y) = random_choice_unrepeatable(res, 2)
+
+        res[s_x][s_y] = "S"
+        res[g_x][g_y] = "G"
+        valid = is_valid(res)
+
+    return ["".join(x) for x in res]
+
 
 TrainState = namedtuple(
     "TrainState", ["params", "opt_state"])
@@ -41,6 +110,7 @@ class Agent():
 
         policy_params = policy.init(
             rng=next(self.prng), S=jnp.ones([1, env.observation_space.n]))
+        self.policy_transform = policy
         self.policy = policy.apply
         self.policy_update, policy_opt_state = self.init_optimiser(
             lr_policy, policy_params)
@@ -60,6 +130,7 @@ class Agent():
 
         irs_params = irs.init(
             rng=next(self.prng), S=jnp.ones([1, env.observation_space.n]))
+        self.irs_transform = irs
         self.irs = irs.apply
         self.irs_update, irs_opt_state = self.init_optimiser(
             lr_irs, irs_params)
@@ -83,6 +154,7 @@ class Agent():
         self.life_gamma = 0.99
 
     # Note that this method should be pure function
+    @partial(jax.jit, static_argnums=0)
     def inner_update(self, eta, learner_state: TrainState, rollout):
         def inner_loss(theta, rollout, returns, advantages):
             logits, v = self._apply_param_on_obs(
@@ -230,7 +302,17 @@ class Agent():
 
     def learn(self):
         intrinsic_update_count = 0
-        for ep in range(50_000):
+        for ep in range(1, 50_000):
+
+            # lifetime reset
+            if args.multiple_lifetime_mode and ep % args.episode_num_per_lifetime == 0:
+                # reset env
+                self.env = coax.wrappers.TrainMonitor(
+                    gym.make('FrozenLake-v1', desc=generate_random_map(size=4), is_slippery=False))
+                # reset policy params
+                self.policy_params = self.policy_transform.init(
+                    rng=next(self.prng), S=jnp.ones([1, self.env.observation_space.n]))
+
             s, _ = self.env.reset()
 
             for t in range(1, self.env.spec.max_episode_steps):
@@ -254,14 +336,16 @@ class Agent():
                     # train
                     self.train()
 
-                    if intrinsic_update_count % 100 == 0:
+                    if intrinsic_update_count % args.save_heatmap_per_time == 0:
                         # save params and heatmap
                         self.save(self.policy_learner_state,
                                   './tmp/params/policy.dp')
                         self.save(self.irs_learner_state,
                                   './tmp/params/irs.dp')
                         self.save_heatmap(
-                            name="heatmap_after_{}_updates".format(intrinsic_update_count))
+                            name="heatmap_after_{}_updates".format(
+                                intrinsic_update_count),
+                            path=args.heat_map_output)
 
                     self.buffer.reset()  # then reset the buffer
 
@@ -271,7 +355,7 @@ class Agent():
                 s = s_next
 
             # early stopping
-            if self.env.avg_G > self.env.spec.reward_threshold:
+            if not args.multiple_lifetime_mode and self.env.avg_G > self.env.spec.reward_threshold:
                 break
 
     def init_optimiser(self, lr, params):
@@ -288,7 +372,7 @@ class Agent():
         with open(path, 'rb') as fp:
             return pickle.load(fp)
 
-    def save_heatmap(self, name="temp", **kwargs):
+    def save_heatmap(self, name="temp", path="./heatmap/", **kwargs):
         plt.figure(figsize=[12, 12])
         plt.subplots_adjust(wspace=0.3, hspace=0.3)
 
@@ -341,7 +425,7 @@ class Agent():
         # 6. rollout exps
 
         # save as png
-        plt.savefig("./heatmap/" + name)
+        plt.savefig(path + name)
         plt.clf()
         plt.close()
 
@@ -412,8 +496,9 @@ class ReplayBuffer(object):
 
 
 if __name__ == "__main__":
-    env = gym.make('FrozenLake-v1', is_slippery=False)
+    env = gym.make('FrozenLake-v1',
+                   desc=generate_random_map(size=4), is_slippery=False)
     env = coax.wrappers.TrainMonitor(env)
-    agent = Agent(env, 0.02, 0.01)
+    agent = Agent(env, 0.02, 0.001)
 
     agent.learn()

@@ -26,7 +26,7 @@ register_pytree_node(
 
 
 class Agent():
-    def __init__(self, env, lr_policy, lr_irs, buffer_size=100, buffer_batch_size=20) -> None:
+    def __init__(self, env, lr_policy, lr_irs, buffer_size=20, buffer_batch_size=5) -> None:
         # prng
         self.prng = hk.PRNGSequence(2)
 
@@ -77,8 +77,6 @@ class Agent():
         # buffer
         self.buffer = ReplayBuffer(
             capacity=buffer_size, batch_size=buffer_batch_size)
-        self.buffer_size = buffer_size
-        self.buffer_batch_size = buffer_batch_size
 
         # gamma
         self.ep_gamma = 0.9
@@ -104,12 +102,14 @@ class Agent():
         policy_opt_state = learner_state.opt_state
 
         irs, _ = self._apply_param_on_obs(
-            self.irs, eta, rollout["s"])
+            self.irs, eta, rollout["ns"])
 
         returns = discounted_returns(
             r_t=irs,
             discount_t=rollout["discounted_t"] * self.ep_gamma,
-            v_t=rollout["v"][-1],
+            # NOTE: Be careful, this line assume the rollout is in an episode
+            # See more at: https://spinningup.openai.com/en/latest/spinningup/rl_intro.html#trajectories
+            v_t=rollout["nv"][-1],
         )
         advantages = returns - rollout["v"]
 
@@ -143,13 +143,17 @@ class Agent():
                 all_ex_r.append(rollout["ex_r"])
                 all_action.append(rollout["a"])
                 all_discounts.append(rollout["discounted_t"])
+
                 logits, _ = self._apply_param_on_obs(
                     self.policy, learner_state.params, rollout["s"])
+                all_logits.append(logits)
+
                 _, lifetime_value = self._apply_param_on_obs(
                     self.irs, eta, rollout["s"])
-                all_logits.append(logits)
                 all_v_lifetime.append(lifetime_value)
-                bootstrap_value_v_lifetime = lifetime_value[-1]
+
+                _, bootstrap_value_v_lifetime = self._apply_param_on_obs(
+                    self.irs, eta, rollout["ns"][-1])
 
                 learner_state = self.inner_update(
                     eta, learner_state, rollout)
@@ -239,9 +243,11 @@ class Agent():
 
                 _, v = self._apply_param_on_obs(
                     self.policy, self.policy_learner_state.params, s)
-                self.buffer.push(s, a, ex_r, v[0], s_next, done)
+                _, nv = self._apply_param_on_obs(
+                    self.policy, self.policy_learner_state.params, s_next)
+                self.buffer.push(s, a, ex_r, v[0], nv[0], s_next, done)
 
-                if len(self.buffer) == self.buffer_size:
+                if self.buffer.is_full():
                     # update counter
                     intrinsic_update_count += 1
                     # train
@@ -366,36 +372,42 @@ class Agent():
 
 
 class ReplayBuffer(object):
-    def __init__(self, capacity, batch_size):
-        self.capacity = capacity
-        self.buffer = []
-        self.batch_size = batch_size
+    def __init__(self, capacity, batch_size, truncated=False):
+        self.capacity = capacity  # transition capacity
+        self.batch_size = batch_size  # every batch max trasition capacity
+        self.max_len = self.capacity // self.batch_size  # buffer size of rollout
+        self.truncated = truncated
+        self.reset()
 
-    def push(self, state, action, reward, value, next_state, done):
-        self.buffer.append((state, action, reward, value, next_state, done))
+    def push(self, state, action, reward, value, next_value, next_state, done):
+        rollout = self.buffer[self.trajectory_idx]
+        rollout.append((state, action, reward, value,
+                        next_value, next_state, done))
 
-    def get_rollout(self, idx, batch_size):
-        state, action, reward, value, next_state, done = zip(
-            *self.buffer[idx:idx + batch_size])
+        if (len(rollout) == self.batch_size) or (done and self.truncated):
+            self.trajectory_idx += 1
+
+    def format_trajectory(self, trajectory):
+        state, action, reward, value, next_value, next_state, done = zip(
+            *trajectory)
         return {'s': jnp.asarray(state), 'a': jnp.asarray(action),
-                'ex_r': jnp.asarray(reward),  'v': jnp.asarray(value),
+                'ex_r': jnp.asarray(reward),  'v': jnp.asarray(value), 'nv': jnp.asarray(next_value),
                 'ns': jnp.asarray(next_state), 'done': jnp.asarray(done),
                 'discounted_t': jnp.ones_like(jnp.asarray(state))}
 
     def get_rollouts(self):
         rollouts = []
-        idx = 0
-        while idx < self.capacity:
-            rollouts.append(self.get_rollout(idx, self.batch_size))
-            idx += self.batch_size
+        for trajectory in self.buffer:
+            rollouts.append(self.format_trajectory(trajectory))
 
         return rollouts
 
-    def __len__(self):
-        return len(self.buffer)
+    def is_full(self):
+        return self.trajectory_idx == self.max_len
 
     def reset(self):
-        self.buffer = []
+        self.buffer = [[] for _ in range(self.max_len)]
+        self.trajectory_idx = 0
 
 
 if __name__ == "__main__":

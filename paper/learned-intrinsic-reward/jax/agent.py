@@ -1,8 +1,7 @@
 import haiku as hk
 import jax
 import jax.numpy as jnp
-from rlax._src.multistep import discounted_returns
-from rlax._src.policy_gradients import policy_gradient_loss, entropy_loss
+from rlax import policy_gradient_loss, entropy_loss, discounted_returns, lambda_returns
 import gymnasium as gym
 import optax
 import numpy as np
@@ -18,6 +17,8 @@ import argparse
 # config.update("jax_debug_nans", True)
 
 # ref: https://github.com/hamishs/JAX-RL/blob/main/src/jax_rl/algorithms/ppo.py
+# ref: https://github.com/deepmind/dm-haiku/blob/f6439a1a234f1c46f0d515ade42de6f47553e7ef/examples/impala/learner.py#L38
+
 
 # Create the parser
 parser = argparse.ArgumentParser(description='Learned Intrinsic Reward Agent')
@@ -26,11 +27,13 @@ parser = argparse.ArgumentParser(description='Learned Intrinsic Reward Agent')
 parser.add_argument(
     '--heat_map_output', default='./heatmap/', help='Path to the the output heatmap directory')
 parser.add_argument(
-    '--episode_num_per_lifetime', default=200, help='')
+    '--episode_num_per_lifetime', default=200, type=int, help='')
 parser.add_argument(
-    '--multiple_lifetime_mode', default=False, help='')
+    '--multiple_lifetime_mode', default=False, type=lambda x: (str(x).lower() in ['true', '1', 'yes']))
 parser.add_argument(
-    '--save_heatmap_per_time', default=100, help='')
+    '--save_heatmap_per_time', default=100, type=int, help='')
+parser.add_argument(
+    '--max_episode_steps', default=20, type=int, help='')
 
 # Parse the command-line arguments
 args = parser.parse_args()
@@ -147,7 +150,7 @@ class Agent():
 
         # buffer
         self.buffer = ReplayBuffer(
-            capacity=buffer_size, batch_size=buffer_batch_size, truncated=True)
+            capacity=buffer_size, batch_size=buffer_batch_size, truncated=False)
 
         # gamma
         self.ep_gamma = 0.9
@@ -176,12 +179,14 @@ class Agent():
         irs, _ = self._apply_param_on_obs(
             self.irs, eta, rollout["ns"])
 
-        returns = discounted_returns(
+        returns = lambda_returns(
             r_t=irs,
             discount_t=rollout["discounted_t"] * self.ep_gamma,
-            # NOTE: Be careful, this line assume the rollout is in an episode
+            # NOTE: Rollout, Episode, Trajectory
             # See more at: https://spinningup.openai.com/en/latest/spinningup/rl_intro.html#trajectories
-            v_t=rollout["nv"][-1],
+            v_t=rollout["nv"],
+            lambda_=0.,
+            stop_target_gradients=False,
         )
         advantages = returns - rollout["v"]
 
@@ -257,6 +262,7 @@ class Agent():
 
             return pg_loss + baseline_loss + 0.01 * entro_loss
 
+        outer_loss = jax.jit(outer_loss)
         dmdeta = jax.grad(outer_loss)(eta, policy_learner_state, rollouts)
         eta_updates, irs_opt_state = self.irs_update(
             dmdeta, irs_opt_state, eta)
@@ -301,9 +307,10 @@ class Agent():
         self.policy_learner_state = policy_learner_state
 
     def learn(self):
+        # for tracking and plot
         intrinsic_update_count = 0
-        for ep in range(1, 50_000):
 
+        for ep in range(1, 50_000):
             # lifetime reset
             if args.multiple_lifetime_mode and ep % args.episode_num_per_lifetime == 0:
                 # reset env
@@ -497,7 +504,9 @@ class ReplayBuffer(object):
 
 if __name__ == "__main__":
     env = gym.make('FrozenLake-v1',
-                   desc=generate_random_map(size=4), is_slippery=False)
+                   #    desc=generate_random_map(size=4),
+                   is_slippery=False,
+                   max_episode_steps=args.max_episode_steps)
     env = coax.wrappers.TrainMonitor(env)
     agent = Agent(env, 0.02, 0.001)
 

@@ -1,23 +1,26 @@
+import argparse
+import pickle
+from collections import namedtuple
+from functools import partial
+
+import coax
+import gymnasium as gym
 import haiku as hk
 import jax
 import jax.numpy as jnp
-from rlax import policy_gradient_loss, entropy_loss, discounted_returns, lambda_returns
-import gymnasium as gym
-import optax
-import numpy as np
-import coax
-import pickle
 import matplotlib.pyplot as plt
+import numpy as np
+import optax
+import wandb
 from jax.tree_util import register_pytree_node
-from collections import namedtuple
-from functools import partial
-import argparse
-
+from rlax import (discounted_returns, entropy_loss, lambda_returns,
+                  policy_gradient_loss)
 
 # config.update("jax_debug_nans", True)
 
 # ref: https://github.com/hamishs/JAX-RL/blob/main/src/jax_rl/algorithms/ppo.py
 # ref: https://github.com/deepmind/dm-haiku/blob/f6439a1a234f1c46f0d515ade42de6f47553e7ef/examples/impala/learner.py#L38
+# ref: https://github.com/deepmind/dm-haiku/blob/main/examples/impala/learner.py
 
 
 # Create the parser
@@ -37,6 +40,21 @@ parser.add_argument(
 
 # Parse the command-line arguments
 args = parser.parse_args()
+
+# start a new wandb run to track this script
+wandb.init(
+    # set the wandb project where this run will be logged
+    project="Learned-Intrinsic-Reward",
+
+    # track hyperparameters and run metadata
+    config={
+        "architecture": "FF",
+        "heat_map_output": args.heat_map_output,
+        "episode_num_per_lifetime": args.episode_num_per_lifetime,
+        "multiple_lifetime_mode": args.multiple_lifetime_mode,
+        "max_episode_steps": args.max_episode_steps,
+    }
+)
 
 
 def generate_random_map(size=8, p=0.8):
@@ -104,9 +122,14 @@ class Agent():
 
         # policy and irs
         def policy_forward(S):
-            logits = hk.Sequential(
-                (hk.Linear(env.action_space.n, w_init=None),))
-            values = hk.Sequential((hk.Linear(1, w_init=None), jnp.ravel))
+            logits = hk.Sequential((
+                hk.Linear(64, w_init=None), jax.nn.relu,
+                hk.Linear(env.action_space.n, w_init=None),
+            ))
+            values = hk.Sequential((
+                hk.Linear(64, w_init=None), jax.nn.relu,
+                hk.Linear(1, w_init=None), jnp.ravel
+            ))
             return logits(S), values(S)
 
         policy = hk.without_apply_rng(hk.transform(policy_forward))
@@ -122,11 +145,13 @@ class Agent():
             values1 = hk.Sequential((
                 hk.Linear(64, w_init=None), jax.nn.relu,
                 hk.Linear(1, w_init=None),
-                jnp.arctan, jnp.ravel))
+                jnp.arctan, jnp.ravel
+            ))
             values2 = hk.Sequential((
                 hk.Linear(64, w_init=None), jax.nn.relu,
                 hk.Linear(1, w_init=None),
-                jnp.ravel))
+                jnp.ravel
+            ))
             return values1(S), values2(S)
 
         irs = hk.without_apply_rng(hk.transform(irs_forward))
@@ -157,7 +182,6 @@ class Agent():
         self.life_gamma = 0.99
 
     # Note that this method should be pure function
-    @partial(jax.jit, static_argnums=0)
     def inner_update(self, eta, learner_state: TrainState, rollout):
         def inner_loss(theta, rollout, returns, advantages):
             logits, v = self._apply_param_on_obs(
@@ -168,10 +192,11 @@ class Agent():
                                            adv_t=advantages,
                                            w_t=masks,
                                            use_stop_gradient=False,)  # important to keep gradient
-            baseline_loss = 0.5 * jnp.sum(jnp.square(v - returns) * masks)
+            baseline_loss = 0.5 * \
+                jnp.sum(jnp.square(v - returns) * masks)
             entro_loss = entropy_loss(logits_t=logits, w_t=masks)
 
-            return pg_loss + baseline_loss + 0.01 * entro_loss
+            return pg_loss + 0.5 * baseline_loss + 0.01 * entro_loss
 
         policy_params = learner_state.params
         policy_opt_state = learner_state.opt_state
@@ -182,8 +207,10 @@ class Agent():
         returns = lambda_returns(
             r_t=irs,
             discount_t=rollout["discounted_t"] * self.ep_gamma,
-            # NOTE: Rollout, Episode, Trajectory
-            # See more at: https://spinningup.openai.com/en/latest/spinningup/rl_intro.html#trajectories
+            # NOTE: Rollout, Episode, Trajectory. In deepmind context, it can cross multiple episodes
+            # See more at:
+            # https://spinningup.openai.com/en/latest/spinningup/rl_intro.html#trajectories
+            # https://github.com/deepmind/dm-haiku/blob/main/examples/impala/learner.py
             v_t=rollout["nv"],
             lambda_=0.,
             stop_target_gradients=False,
@@ -260,10 +287,11 @@ class Agent():
             entro_loss = entropy_loss(
                 logits_t=all_logits, w_t=masks)
 
-            return pg_loss + baseline_loss + 0.01 * entro_loss
+            return pg_loss + 0.5 * baseline_loss + 0.01 * entro_loss
 
-        outer_loss = jax.jit(outer_loss)
-        dmdeta = jax.grad(outer_loss)(eta, policy_learner_state, rollouts)
+        value, dmdeta = jax.value_and_grad(outer_loss)(
+            eta, policy_learner_state, rollouts)
+        wandb.log({"irs_loss": value.item()})
         eta_updates, irs_opt_state = self.irs_update(
             dmdeta, irs_opt_state, eta)
         irs_params = optax.apply_updates(eta, eta_updates)
@@ -366,8 +394,10 @@ class Agent():
                 break
 
     def init_optimiser(self, lr, params):
-        optimizer = optax.chain(optax.clip(1.0),
-                                optax.adam(lr, b1=0.9, b2=0.99),)
+        optimizer = optax.chain(
+            # optax.clip(1.0),
+            optax.adam(lr, b1=0.9, b2=0.99),
+        )
         opt_state = optimizer.init(params)
         return optimizer.update, opt_state
 
@@ -504,10 +534,11 @@ class ReplayBuffer(object):
 
 if __name__ == "__main__":
     env = gym.make('FrozenLake-v1',
-                   #    desc=generate_random_map(size=4),
+                   desc=generate_random_map(
+                       size=4) if args.multiple_lifetime_mode else None,
                    is_slippery=False,
                    max_episode_steps=args.max_episode_steps)
     env = coax.wrappers.TrainMonitor(env)
-    agent = Agent(env, 0.02, 0.001)
+    agent = Agent(env, 0.02, 0.01)
 
     agent.learn()

@@ -193,7 +193,7 @@ class Agent():
                                            w_t=masks,
                                            use_stop_gradient=False,)  # important to keep gradient
             baseline_loss = 0.5 * \
-                jnp.sum(jnp.square(v - returns) * masks)
+                jnp.mean(jnp.square(v - returns) * masks)
             entro_loss = entropy_loss(logits_t=logits, w_t=masks)
 
             return pg_loss + 0.5 * baseline_loss + 0.01 * entro_loss
@@ -204,6 +204,12 @@ class Agent():
         irs, _ = self._apply_param_on_obs(
             self.irs, eta, rollout["ns"])
 
+        # This is the line to split the episode
+        # when lambda is zero, n-step bootstrapping will stop at the end of the episode
+        # See more at:
+        # https://github.com/deepmind/dm-haiku/blob/adfb8331b590fa036e19f7ee58b9e1d5a2a8d189/examples/impala/learner.py#L114C1-L117C36
+        lambda_ = jnp.not_equal(rollout["done"], True).astype(jnp.float32)
+
         returns = lambda_returns(
             r_t=irs,
             discount_t=rollout["discounted_t"] * self.ep_gamma,
@@ -212,7 +218,7 @@ class Agent():
             # https://spinningup.openai.com/en/latest/spinningup/rl_intro.html#trajectories
             # https://github.com/deepmind/dm-haiku/blob/main/examples/impala/learner.py
             v_t=rollout["nv"],
-            lambda_=0.,
+            lambda_=lambda_,
             stop_target_gradients=False,
         )
         advantages = returns - rollout["v"]
@@ -283,7 +289,7 @@ class Agent():
                 w_t=masks,
                 use_stop_gradient=True,)
             baseline_loss = 0.5 * \
-                jnp.sum(jnp.square(all_v_lifetime - returns) * masks)
+                jnp.mean(jnp.square(all_v_lifetime - returns) * masks)
             entro_loss = entropy_loss(
                 logits_t=all_logits, w_t=masks)
 
@@ -291,10 +297,16 @@ class Agent():
 
         value, dmdeta = jax.value_and_grad(outer_loss)(
             eta, policy_learner_state, rollouts)
-        wandb.log({"irs_loss": value.item()})
         eta_updates, irs_opt_state = self.irs_update(
             dmdeta, irs_opt_state, eta)
         irs_params = optax.apply_updates(eta, eta_updates)
+
+        # wandb log
+        wandb.log({
+            "irs_loss": value.item(),
+            "avg_G": self.env.avg_G,
+            "episode_num": self.env.ep,
+            "transitions": self.env.T})
 
         return TrainState(irs_params, irs_opt_state)
 
@@ -338,7 +350,7 @@ class Agent():
         # for tracking and plot
         intrinsic_update_count = 0
 
-        for ep in range(1, 50_000):
+        for ep in range(1, 50_0000):
             # lifetime reset
             if args.multiple_lifetime_mode and ep % args.episode_num_per_lifetime == 0:
                 # reset env
@@ -363,7 +375,7 @@ class Agent():
                 _, nv = self._apply_param_on_obs(
                     self.policy, self.policy_learner_state.params, s_next)
                 self.buffer.push(
-                    s, a, ex_r, v[0], 0. if done else nv[0], s_next, done)
+                    s, a, ex_r, v[0], nv[0], s_next, done)
 
                 if self.buffer.is_full():
                     # update counter
@@ -535,10 +547,10 @@ class ReplayBuffer(object):
 if __name__ == "__main__":
     env = gym.make('FrozenLake-v1',
                    desc=generate_random_map(
-                       size=4) if args.multiple_lifetime_mode else None,
+                       size=4) if args.multiple_lifetime_mode else ["SFFF", "FFFH", "FFFH", "HFFG"],
                    is_slippery=False,
                    max_episode_steps=args.max_episode_steps)
     env = coax.wrappers.TrainMonitor(env)
-    agent = Agent(env, 0.02, 0.01)
+    agent = Agent(env, 0.02, 0.001)
 
     agent.learn()
